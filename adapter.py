@@ -262,6 +262,8 @@ def _parse_muc_rooms(value: str, default_nick: Optional[str]) -> List[_MucRoom]:
 class XmppAdapter(BasePlatformAdapter):
     """slixmpp-backed adapter satisfying BasePlatformAdapter."""
 
+    MAX_MESSAGE_LENGTH = 4000
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
         extra = config.extra or {}
@@ -296,6 +298,9 @@ class XmppAdapter(BasePlatformAdapter):
         self._omemo_initialized = asyncio.Event()
         self._omemo_initialized_occurred = False
 
+        # Reconnection state
+        self._reconnecting: bool = False
+
         # Lazy state
         self.client: Optional[Any] = None
         self._process_task: Optional[asyncio.Task] = None
@@ -313,6 +318,9 @@ class XmppAdapter(BasePlatformAdapter):
     # -----------------------------------------------------------------
 
     async def connect(self) -> bool:
+        # Reset reconnection state for a fresh connection attempt
+        self._reconnecting = False
+
         client = ClientXMPP(self.jid, self._password)
         # Plugins - core
         for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0363"):
@@ -395,7 +403,12 @@ class XmppAdapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
+        self._reconnecting = False  # cancel any in-flight reconnect
         if self.client is not None:
+            # Remove our handler so intentional disconnect doesn't trigger
+            # slixmpp reconnect.  The deferred _end_stream_wait may fire
+            # 'disconnected' after we return — this ensures it's a no-op.
+            self.client.del_event_handler('disconnected', self._on_disconnected)
             try:
                 self.client.disconnect()
             except Exception:
@@ -407,26 +420,63 @@ class XmppAdapter(BasePlatformAdapter):
         self._mark_disconnected()
 
     async def _run_process(self) -> None:
-        """slixmpp's process loop."""
+        """slixmpp's process loop.  Awaits client.disconnected.
+
+        When the connected future resolves (network loss, server restart,
+        or intentional shutdown), this coroutine cleans up.  If the
+        disconnect was unexpected and a reconnect is in progress
+        (initiated by _on_disconnected via slixmpp's reconnect()), the
+        task is restarted to watch the new connection.  Intentional
+        shutdowns propagate CancelledError and perform final cleanup.
+        """
         if self.client is None:
             return
         try:
             await self.client.disconnected
         except asyncio.CancelledError:
-            # slixmpp's event may not yield during disconnect, so force a
-            # disconnect to unblock any internal awaits before the task unwinds.
-            if self.client is not None:
-                try:
-                    self.client.disconnect()
-                except Exception:
-                    pass
-            raise  # re-raise so the task is properly marked cancelled
+            raise
         except Exception:
             logger.exception("xmpp: process loop crashed")
+        finally:
+            if self._reconnecting:
+                # Reconnect in progress — slixmpp's _connect_loop is
+                # retrying.  Restart this task so it watches the new
+                # connection's lifecycle.
+                loop = asyncio.get_event_loop()
+                self._process_task = loop.create_task(self._run_process())
+            elif (
+                self.client is not None
+                and not self.has_fatal_error
+            ):
+                # Unexpected exit with no reconnect in flight.
+                # Signal the gateway watcher to take over.
+                logger.warning(
+                    "xmpp: process loop exited without explicit disconnect — "
+                    "signalling reconnect"
+                )
+                self._set_fatal_error(
+                    "xmpp_process_lost",
+                    "XMPP process loop ended unexpectedly — will retry",
+                    retryable=True,
+                )
+                if self.client is not None:
+                    self._reconnecting = True  # prevent _on_disconnected re-trigger
+                    try:
+                        self.client.disconnect()
+                    except Exception:
+                        pass
+                    self.client = None
 
     async def _on_session_start(self, _event: Any) -> None:
         if self.client is None:
             return
+
+        # Handle successful reconnection
+        if self._reconnecting:
+            self._reconnecting = False
+            self._mark_connected()
+            logger.info("xmpp: reconnected successfully")
+
         self.client.send_presence()  # type: ignore[union-attr]
         try:
             await self.client.get_roster()  # type: ignore[union-attr]
@@ -445,8 +495,40 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("xmpp: ad-hoc command setup failed", exc_info=True)
 
-    async def _on_disconnected(self, _event: Any) -> None:
-        self._mark_disconnected()
+    def _on_disconnected(self, _event: Any) -> None:
+        """Synchronous handler — must NOT be async.
+
+        slixmpp fires the 'disconnected' event synchronously inside
+        connection_lost(), before resolving client.disconnected (the Future).
+        If this handler is async, slixmpp creates a task for it that runs
+        AFTER _run_process wakes up from client.disconnected — the finally
+        block sees _reconnecting=False and nukes self.client before we get
+        a chance to act.
+
+        Making it synchronous guarantees _reconnecting is set before
+        _run_process resumes.
+        """
+        if self._reconnecting:
+            # Reconnect already in progress — slixmpp's reconnect() calls
+            # disconnect() internally, which fires this event again.
+            return
+        if self.client is None:
+            # Stale event after client cleanup — nothing to reconnect.
+            return
+        logger.warning(
+            "xmpp: unexpected disconnect — attempting reconnect via slixmpp"
+        )
+        self._reconnecting = True
+        try:
+            self.client.reconnect(wait=0.0, reason="Network unreachable")
+        except Exception:
+            logger.exception("xmpp: reconnect() call failed, falling back to gateway watcher")
+            self._reconnecting = False
+            self._set_fatal_error(
+                "xmpp_disconnected",
+                "XMPP connection lost — will retry via gateway",
+                retryable=True,
+            )
 
     async def _on_failed_auth(self, _event: Any) -> None:
         self._set_fatal_error(
@@ -521,11 +603,21 @@ class XmppAdapter(BasePlatformAdapter):
                 )
                 return
 
+            # Extract XEP-0201 thread id for session isolation
+            thread_id: Optional[str] = None
+            try:
+                thread_elem = stanza.get("thread", None)
+                if thread_elem is not None:
+                    thread_id = str(thread_elem) or None
+            except Exception:
+                pass
+
             source = self.build_source(
                 chat_id=chat_id,
                 chat_type=chat_type,
                 user_id=user_id,
                 user_name=user_name,
+                thread_id=thread_id,
             )
             # Extract reply context for XEP-0461
             reply_to_message_id = None
@@ -601,6 +693,10 @@ class XmppAdapter(BasePlatformAdapter):
         if self.client is None or not getattr(self, "_running", True):
             return SendResult(success=False, error="xmpp not connected", retryable=True)
 
+        # Extract thread_id from metadata if not provided directly
+        if thread_id is None and metadata:
+            thread_id = metadata.get("thread_id")
+
         # Forward legacy media params to dedicated methods
         if voice_path:
             return await self.send_voice(chat_id, voice_path, caption=content or None)
@@ -623,7 +719,7 @@ class XmppAdapter(BasePlatformAdapter):
             and mtype == "chat"
         ):
             try:
-                return await self._send_encrypted(chat_id, content)
+                return await self._send_encrypted(chat_id, content, thread_id=thread_id)
             except Exception as exc:
                 logger.warning(
                     "OMEMO: encryption failed for %s (%s), sending plaintext", chat_id, exc
@@ -632,35 +728,44 @@ class XmppAdapter(BasePlatformAdapter):
 
         try:
             client_local = self.client  # type: ignore[assignment]
-            # Use XEP-0461 reply if reply_to is provided and plugin is available.
-            # slixmpp 1.15 expects the quoted author JID and quoted message id
-            # as positional parameters, then normal make_message kwargs.
-            if reply_to and "xep_0461" in self._registered_plugins:
-                stanza = client_local["xep_0461"].make_reply(
-                    reply_to=JID(chat_id),
-                    reply_id=reply_to,
-                    mto=chat_id,
-                    mbody=content,
-                    mtype=mtype,
-                    mchat_state="active",
-                )
-                stanza.send()
-            else:
-                stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype, mchat_state="active")
-            # Attach XEP-0394 markup if available
-            if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
+            chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
+            last_msg_id = None
+            for i, chunk in enumerate(chunks):
+                if i > 0:
+                    await asyncio.sleep(0.3)  # avoid XMPP server rate-limit bursts
+                # Only the first chunk gets the reply attachment;
+                # subsequent chunks are standalone but share the thread.
+                chunk_reply_to = reply_to if i == 0 else None
+                if chunk_reply_to and "xep_0461" in self._registered_plugins:
+                    stanza = client_local["xep_0461"].make_reply(
+                        reply_to=JID(chat_id),
+                        reply_id=chunk_reply_to,
+                        mto=chat_id,
+                        mbody=chunk,
+                        mtype=mtype,
+                        mchat_state="active",
+                    )
+                else:
+                    stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype, mchat_state="active")
+                # Attach XEP-0201 thread id for thread-aware clients
+                if thread_id:
+                    stanza["thread"] = thread_id
+                # Attach XEP-0394 markup if available
+                if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
+                    try:
+                        markup = self._build_markup(chunk)
+                        if markup is not None:
+                            stanza.xml.append(markup.xml)
+                    except Exception:
+                        logger.debug("xmpp: failed to attach markup", exc_info=True)
+                # Reply stanzas need explicit send; regular send_message already sent
+                if chunk_reply_to and "xep_0461" in self._registered_plugins:
+                    stanza.send()
                 try:
-                    markup = self._build_markup(content)
-                    if markup is not None:
-                        stanza.xml.append(markup.xml)
+                    last_msg_id = stanza["id"]
                 except Exception:
-                    logger.debug("xmpp: failed to attach markup", exc_info=True)
-            msg_id = None
-            try:
-                msg_id = stanza["id"]
-            except Exception:
-                pass
-            return SendResult(success=True, message_id=msg_id, raw_response=stanza)
+                    pass
+            return SendResult(success=True, message_id=last_msg_id)
         except Exception as exc:
             logger.exception("xmpp: send failed")
             return SendResult(success=False, error=str(exc), retryable=True)
@@ -824,61 +929,64 @@ class XmppAdapter(BasePlatformAdapter):
             markup.xml.append(s.xml)
         return markup if spans else None
 
-    async def _send_encrypted(self, chat_id: str, content: str) -> SendResult:
-        """Send an OMEMO-encrypted 1:1 chat message."""
+    async def _send_encrypted(self, chat_id: str, content: str, *, thread_id: Optional[str] = None) -> SendResult:
+        """Send an OMEMO-encrypted 1:1 chat message, split into chunks if needed."""
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
+
+        chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
         client_local = self.client  # type: ignore[assignment]
         xep_0384 = client_local["xep_0384"]
         mtype = "chat"
-        stanza = client_local.make_message(mto=chat_id, mtype=mtype)
-        stanza["body"] = content
-        stanza.set_from(client_local.boundjid)
+        last_msg_id = None
 
-        recipient_jid = JID(chat_id)
-        message, encryption_errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
+        for i, chunk in enumerate(chunks):
+            if i > 0:
+                await asyncio.sleep(0.3)
+            stanza = client_local.make_message(mto=chat_id, mtype=mtype)
+            stanza["body"] = chunk
+            if thread_id:
+                stanza["thread"] = thread_id
+            stanza.set_from(client_local.boundjid)
 
-        if encryption_errors:
-            logger.info("OMEMO: encryption non-critical errors: %s", encryption_errors)
+            recipient_jid = JID(chat_id)
+            message, encryption_errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
 
-        if message is None:
-            logger.warning("OMEMO: nothing to encrypt, falling back to plaintext")
-            client_local = self.client  # type: ignore[assignment]
-            stanza = client_local.send_message(mto=chat_id, mbody=content, mtype=mtype, mchat_state="active")
-            msg_id = None
+            if encryption_errors:
+                logger.info("OMEMO: encryption non-critical errors: %s", encryption_errors)
+
+            if message is None:
+                logger.warning("OMEMO: nothing to encrypt, falling back to plaintext")
+                stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype, mchat_state="active")
+                try:
+                    last_msg_id = stanza["id"]
+                except Exception:
+                    pass
+                continue
+
+            # Explicit Message Encryption (XEP-0380) hint for compatibility.
+            if "xep_0380" in self._registered_plugins:
+                try:
+                    import oldmemo
+                    ns = oldmemo.oldmemo.NAMESPACE
+                    message["eme"]["namespace"] = ns
+                    message["eme"]["name"] = client_local["xep_0380"].mechanisms[ns]
+                except Exception:
+                    pass
+
+            # Attach XEP-0085 chat state after encryption
+            if "xep_0085" in self._registered_plugins:
+                try:
+                    message["chat_state"] = "active"
+                except Exception:
+                    pass
+            message.send()
             try:
-                msg_id = stanza["id"]
+                last_msg_id = message["id"]
             except Exception:
                 pass
-            return SendResult(success=True, message_id=msg_id, raw_response=stanza)
 
-        # Explicit Message Encryption (XEP-0380) hint for compatibility.
-        # Only set it when the plugin is actually registered; without it the
-        # 'eme' interface doesn't exist and accessing it logs an "Unknown
-        # stanza interface" warning per slixmpp.
-        if "xep_0380" in self._registered_plugins:
-            try:
-                import oldmemo
-                ns = oldmemo.oldmemo.NAMESPACE
-                message["eme"]["namespace"] = ns
-                message["eme"]["name"] = client_local["xep_0380"].mechanisms[ns]
-            except Exception:
-                pass
-
-        # Attach XEP-0085 chat state after encryption (encrypt_message clears
-        # non-OMEMO elements, so we set it on the encrypted message object).
-        if "xep_0085" in self._registered_plugins:
-            try:
-                message["chat_state"] = "active"
-            except Exception:
-                pass
-        message.send()
-        msg_id = None
-        try:
-            msg_id = message["id"]
-        except Exception:
-            pass
-        return SendResult(success=True, message_id=msg_id, raw_response=message)
+        return SendResult(success=True, message_id=last_msg_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         if self.client is None or "xep_0085" not in self._registered_plugins or not getattr(self, "_running", True):
