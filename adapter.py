@@ -1090,6 +1090,10 @@ class XmppAdapter(BasePlatformAdapter):
                     message["reply"]["id"] = chunk_reply_to
                 except Exception:
                     logger.debug("xmpp: failed to attach reply to encrypted message", exc_info=True)
+            logger.info(
+                "xmpp: enc reply_to=%s xml=%s",
+                chunk_reply_to, str(message.xml)[:400],
+            )
             message.send()
             try:
                 last_msg_id = message["id"]
