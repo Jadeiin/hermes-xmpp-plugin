@@ -313,6 +313,11 @@ class XmppAdapter(BasePlatformAdapter):
         self._pending_reactions: Dict[str, Any] = {}
         self._reactions_enabled: bool = os.getenv("XMPP_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+        # MUC reply tracking: message_id → sender's Full JID (room@conf/nick)
+        # XEP-0461 requires the Full JID of the original author for the reply
+        # element's @to attribute.
+        self._muc_sender_jids: Dict[str, str] = {}
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
@@ -545,6 +550,40 @@ class XmppAdapter(BasePlatformAdapter):
     # Inbound
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def _extract_stanza_id(stanza: Any, room_bare_jid: str) -> Optional[str]:
+        """Extract XEP-0359 <stanza-id> where @by matches room bare JID."""
+        try:
+            from xml.etree import ElementTree
+            xml = getattr(stanza, "xml", None)
+            if xml is None:
+                return None
+            ns = "urn:xmpp:sid:0"
+            for elem in xml.iter():
+                if elem.tag == f"{{{ns}}}stanza-id":
+                    by = elem.get("by", "")
+                    if by == room_bare_jid:
+                        return elem.get("id") or None
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _extract_origin_id(stanza: Any) -> Optional[str]:
+        """Extract XEP-0359 <origin-id> for 1:1 chats."""
+        try:
+            from xml.etree import ElementTree
+            xml = getattr(stanza, "xml", None)
+            if xml is None:
+                return None
+            ns = "urn:xmpp:sid:0"
+            for elem in xml.iter():
+                if elem.tag == f"{{{ns}}}origin-id":
+                    return elem.get("id") or None
+        except Exception:
+            pass
+        return None
+
     async def _on_message(self, stanza: Any) -> None:
         try:
             stanza_type = stanza["type"]
@@ -654,7 +693,26 @@ class XmppAdapter(BasePlatformAdapter):
                             reply_to_text = raw_body
                 except Exception:
                     pass
+            # XEP-0461 §4.2: for groupchat, use <stanza-id> (XEP-0359) instead
+            # of the stanza's 'id' attribute, which MUST NOT be used for replies.
             msg_id = stanza.get("id") or None
+            reply_to_jid: Optional[str] = None
+            if stanza_type == "groupchat":
+                try:
+                    stanza_id = self._extract_stanza_id(stanza, from_bare)
+                    if stanza_id:
+                        msg_id = stanza_id
+                except Exception:
+                    pass
+                reply_to_jid = from_full  # store sender's Full JID for reply @to
+            else:
+                # 1:1 prefers <origin-id>, falls back to stanza 'id'
+                try:
+                    origin_id = self._extract_origin_id(stanza)
+                    if origin_id:
+                        msg_id = origin_id
+                except Exception:
+                    pass
             event = MessageEvent(
                 text=body,
                 message_type=MessageType.TEXT,
@@ -664,6 +722,9 @@ class XmppAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
             )
+            # Store sender's Full JID for MUC reply @to (XEP-0461)
+            if reply_to_jid and msg_id:
+                self._muc_sender_jids[msg_id] = reply_to_jid
             await self.handle_message(event)
         except Exception:
             logger.exception("xmpp: error handling inbound stanza")
@@ -764,8 +825,14 @@ class XmppAdapter(BasePlatformAdapter):
                 # subsequent chunks are standalone but share the thread.
                 chunk_reply_to = reply_to if i == 0 else None
                 if chunk_reply_to and "xep_0461" in self._registered_plugins:
+                    # XEP-0461: @to should be the Full JID of the original
+                    # author.  For MUC, look up the sender's room JID; for
+                    # 1:1, use the bare chat JID.
+                    reply_jid: str = self._muc_sender_jids.get(
+                        chunk_reply_to, str(JID(chat_id))
+                    )
                     stanza = client_local["xep_0461"].make_reply(
-                        reply_to=JID(chat_id),
+                        reply_to=reply_jid,
                         reply_id=chunk_reply_to,
                         mto=chat_id,
                         mbody=chunk,
