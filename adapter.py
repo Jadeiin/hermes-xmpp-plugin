@@ -654,9 +654,19 @@ class XmppAdapter(BasePlatformAdapter):
             logger.exception("xmpp: error handling inbound stanza")
 
     def _muc_real_jid(self, stanza: Any) -> Optional[str]:
+        """Extract the real JID from a MUC stanza's <x> element.
+
+        In non-anonymous MUCs, the server includes the sender's real JID
+        in <x xmlns='http://jabber.org/protocol/muc#user'><item jid='...'/>.
+        slixmpp exposes this via stanza['muc']['jid'] (MUCBase.get_jid
+        reads it from the <item/> child).  We must use __getitem__ access
+        ('muc['jid']') — Python attribute access (muc.jid) does NOT work
+        because slixmpp's MUCMessage does not expose 'jid' as a Python
+        attribute (only via __getitem__ interface resolution).
+        """
         try:
             muc = stanza.get("muc")
-            if muc and getattr(muc, "jid", None):
+            if muc and muc["jid"]:
                 return self._bare(str(muc["jid"]))
         except Exception:
             pass

@@ -301,3 +301,72 @@ class TestMucDetection:
         a._known_mucs = set()
         assert a._is_muc("room@conference.example.org") is False
         assert a._is_muc("user@example.org") is False
+
+
+# -----------------------------------------------------------------
+# 7. MUC real JID extraction (_muc_real_jid)
+# -----------------------------------------------------------------
+
+class TestMucRealJid:
+    """_muc_real_jid must use muc['jid'] not getattr(muc, 'jid', None).
+
+    slixmpp's MUCMessage exposes 'jid' via __getitem__ interface
+    resolution, NOT as a Python attribute.  getattr(muc, 'jid', None)
+    always returns None, causing real JIDs to be silently dropped.
+    """
+
+    def test_extracts_real_jid_from_item(self, adapter_instance):
+        """Non-anonymous MUC: stanza['muc']['jid'] returns the real JID."""
+        class _FakeMuc:
+            def __getitem__(self, k):
+                return "realuser@example.org" if k == "jid" else None
+            def __bool__(self):
+                return True
+        muc_elem = _FakeMuc()
+
+        class _FakeStanza:
+            def get(self, k, default=None):
+                return muc_elem if k == "muc" else default
+            def __getitem__(self, k):
+                return muc_elem if k == "muc" else None
+
+        stanza = _FakeStanza()
+        result = adapter_instance._muc_real_jid(stanza)
+        assert result == "realuser@example.org"
+
+    def test_returns_none_when_muc_missing(self, adapter_instance):
+        """Regular DM stanza with no <muc> element returns None."""
+        class _FakeStanza:
+            def get(self, k, default=None):
+                return default
+        stanza = _FakeStanza()
+        assert adapter_instance._muc_real_jid(stanza) is None
+
+    def test_returns_none_when_jid_empty(self, adapter_instance):
+        """Anonymous MUC: muc['jid'] is empty → returns None."""
+        class _FakeMuc:
+            def __getitem__(self, k):
+                return ""  # empty jid
+            def __bool__(self):
+                return True
+
+        class _FakeStanza:
+            def get(self, k, default=None):
+                muc = _FakeMuc()
+                return muc if k == "muc" else default
+
+        stanza = _FakeStanza()
+        assert adapter_instance._muc_real_jid(stanza) is None
+
+    def test_handles_attribute_error_gracefully(self, adapter_instance):
+        """If muc element exists but has no __getitem__, don't crash."""
+        class _FakeMuc:
+            def __bool__(self):
+                return True
+
+        class _FakeStanza:
+            def get(self, k, default=None):
+                return _FakeMuc() if k == "muc" else default
+
+        stanza = _FakeStanza()
+        assert adapter_instance._muc_real_jid(stanza) is None
