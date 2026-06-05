@@ -313,6 +313,11 @@ class XmppAdapter(BasePlatformAdapter):
         self._pending_reactions: Dict[str, Any] = {}
         self._reactions_enabled: bool = os.getenv("XMPP_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+        # Dedup: suppress gateway follow-up double-send for same (chat_id, reply_to)
+        # within REACTION_DEDUP_WINDOW seconds.
+        self._REACTION_DEDUP_WINDOW = 10.0
+        self._sent_replies: Dict[tuple, float] = {}
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
@@ -736,6 +741,24 @@ class XmppAdapter(BasePlatformAdapter):
                 if last_result is not None and not last_result.success:
                     return last_result
             return last_result or SendResult(success=True)
+
+        # Dedup: suppress gateway follow-up double-send.
+        # The gateway's "Queued follow-up" path sends the same response
+        # without streaming confirmation, then the normal response path
+        # sends again — both with the same reply_to.  Track (chat_id,
+        # reply_to) pairs within a short window and suppress duplicates.
+        if reply_to:
+            now = asyncio.get_event_loop().time()
+            dedup_key = (chat_id, reply_to)
+            last_sent = self._sent_replies.get(dedup_key)
+            if last_sent is not None and (now - last_sent) < self._REACTION_DEDUP_WINDOW:
+                logger.debug(
+                    "xmpp: suppressing duplicate send to %s (reply %s) — "
+                    "%.1fs since last send",
+                    chat_id, reply_to, now - last_sent,
+                )
+                return SendResult(success=True, message_id=None)
+            self._sent_replies[dedup_key] = now
 
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
 
