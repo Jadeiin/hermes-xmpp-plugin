@@ -589,7 +589,20 @@ class XmppAdapter(BasePlatformAdapter):
                 chat_type = "group"
                 chat_id = from_bare
                 user_name = from_resource or None
-                user_id = self._muc_real_jid(stanza) or chat_id
+                # Resolve real JID: roster (from presence stanzas) → stanza → room JID
+                real_jid = None
+                try:
+                    if self.client is not None and "xep_0045" in self._registered_plugins:
+                        real_jid = self.client["xep_0045"].get_jid_property(
+                            from_bare, from_resource, "jid"
+                        )
+                except Exception:
+                    pass
+                user_id = real_jid or self._muc_real_jid(stanza) or chat_id
+                if real_jid:
+                    logger.debug("xmpp: MUC real JID from roster: %s → %s", from_resource, real_jid)
+                elif user_id == chat_id:
+                    logger.debug("xmpp: MUC anonymous — no real JID for %s in %s", from_resource, from_bare)
             else:
                 chat_type = "dm"
                 chat_id = from_bare
@@ -667,9 +680,11 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             muc = stanza.get("muc")
             if muc and muc["jid"]:
-                return self._bare(str(muc["jid"]))
-        except Exception:
-            pass
+                jid = str(muc["jid"])
+                logger.debug("xmpp: MUC real JID extracted: %s", jid)
+                return self._bare(jid)
+        except Exception as exc:
+            logger.debug("xmpp: MUC real JID extraction failed: %s", exc)
         return None
 
     def _is_authorized(self, *, chat_type: str, chat_id: str, user_jid: str) -> bool:
