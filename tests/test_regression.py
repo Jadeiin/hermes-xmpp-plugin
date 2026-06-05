@@ -63,6 +63,15 @@ gw_base.SendResult = type("SendResult", (), {
     "__init__": lambda s, **kw: s.__dict__.update(kw) or None,
 })
 
+def _mock_truncate(self, content, max_len, **kw):
+    """Minimal truncate_message for tests: splits at max_len boundaries."""
+    if max_len <= 0 or len(content) <= max_len:
+        return [content]
+    chunks = []
+    for i in range(0, len(content), max_len):
+        chunks.append(content[i:i + max_len])
+    return chunks
+
 gw_base.BasePlatformAdapter = type("BasePlatformAdapter", (), {
     "__init__": lambda s, *a, **k: setattr(s, "config", a[0] if a else None) or None,
     "emit_message_raw": lambda *a, **kw: None,
@@ -74,6 +83,7 @@ gw_base.BasePlatformAdapter = type("BasePlatformAdapter", (), {
     "build_source": lambda s, **kw: MagicMock(**kw),
     "_mark_disconnected": lambda s: None,
     "fatal_error_message": lambda s, *a, **kw: "auth failed",
+    "truncate_message": _mock_truncate,
 })
 
 gw_models = unittest.mock.MagicMock()
@@ -257,3 +267,37 @@ class TestOmemoStorage:
         asyncio.run(store._store("gone", 1))
         asyncio.run(store._delete("gone"))
         assert "gone" not in store._data
+
+
+# -----------------------------------------------------------------
+# 6. MUC detection (_is_muc) — prefix heuristic removed (Issue #2 fix)
+# -----------------------------------------------------------------
+
+class TestMucDetection:
+    """_is_muc now only checks _known_mucs (configured rooms)."""
+
+    def test_configured_room_is_muc(self, adapter_instance):
+        adapter_instance._known_mucs.add("room@conference.example.org")
+        assert adapter_instance._is_muc("room@conference.example.org") is True
+
+    def test_unconfigured_jid_is_not_muc(self, adapter_instance):
+        assert adapter_instance._is_muc("user@example.org") is False
+
+    def test_chat_domain_not_muc(self, adapter_instance):
+        """Regression: Issue #2 — Snikket 'chat.' domain is NOT a MUC."""
+        assert adapter_instance._is_muc("user@chat.snikket.example") is False
+
+    def test_conference_domain_not_muc_if_unconfigured(self, adapter_instance):
+        """Prefix matching removed — even 'conference.' domain needs config."""
+        assert adapter_instance._is_muc("unknown@conference.example.org") is False
+
+    def test_empty_known_mucs_nothing_is_muc(self):
+        cfg = MagicMock()
+        cfg.jid = "hermes@example.org"
+        cfg.password = "secret"
+        cfg.home_channel = None
+        cfg.fileserver_url = None
+        a = adapter.XmppAdapter(cfg)
+        a._known_mucs = set()
+        assert a._is_muc("room@conference.example.org") is False
+        assert a._is_muc("user@example.org") is False

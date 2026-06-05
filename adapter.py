@@ -1327,13 +1327,8 @@ class XmppAdapter(BasePlatformAdapter):
         chat_type = "group" if self._is_muc(chat_id) else "dm"
         return {"chat_id": chat_id, "type": chat_type, "name": chat_id}
 
-    _MUC_DOMAIN_PREFIXES = ("conference.", "muc.", "rooms.", "chat.", "groups.")
-
     def _is_muc(self, chat_id: str) -> bool:
-        if chat_id in self._known_mucs:
-            return True
-        domain = chat_id.split("@", 1)[-1]
-        return any(domain.startswith(p) for p in self._MUC_DOMAIN_PREFIXES)
+        return chat_id in self._known_mucs
 
     @staticmethod
     def _bare(jid: str) -> str:

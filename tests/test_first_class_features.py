@@ -63,12 +63,22 @@ gw_base.SendResult = type("SendResult", (), {
     "__init__": lambda s, **kw: s.__dict__.update(kw) or None,
 })
 
+def _mock_truncate(self, content, max_len, **kw):
+    """Minimal truncate_message for tests: splits at max_len boundaries."""
+    if max_len <= 0 or len(content) <= max_len:
+        return [content]
+    chunks = []
+    for i in range(0, len(content), max_len):
+        chunks.append(content[i:i + max_len])
+    return chunks
+
 gw_base.BasePlatformAdapter = type("BasePlatformAdapter", (), {
     "__init__": lambda s, *a, **k: setattr(s, "config", a[0] if a else None) or None,
     "emit_message_raw": lambda *a, **kw: None,
     "on_processing_start": lambda *a, **kw: None,
     "on_processing_complete": lambda *a, **kw: None,
     "send": lambda *a, **kw: None,
+    "truncate_message": _mock_truncate,
 })
 
 gw_models = unittest.mock.MagicMock()
@@ -211,6 +221,8 @@ async def test_on_processing_start_triggers_reaction(fake_adapter, fake_client):
 async def test_on_processing_complete_success(fake_adapter, fake_client):
     xep0444 = MagicMock()
     fake_client.plugins["xep_0444"] = xep0444
+    msg_mock = MagicMock()
+    fake_client.make_message.return_value = msg_mock
 
     source = MagicMock()
     source.chat_id = "user@example.org"
@@ -223,15 +235,17 @@ async def test_on_processing_complete_success(fake_adapter, fake_client):
 
     await fake_adapter.on_processing_complete(event=evt, outcome=ProcessingOutcome.SUCCESS)
 
-    xep0444.send_reactions.assert_called()
-    calls = xep0444.send_reactions.call_args_list
-    assert any("✅" in str(c) for c in calls)
+    # Completion sends empty (clear) then ✅
+    assert xep0444.set_reactions.call_count == 2
+    xep0444.set_reactions.assert_any_call(msg_mock, "msg-1", ["✅"])
 
 
 @pytest.mark.asyncio
 async def test_on_processing_complete_error(fake_adapter, fake_client):
     xep0444 = MagicMock()
     fake_client.plugins["xep_0444"] = xep0444
+    msg_mock = MagicMock()
+    fake_client.make_message.return_value = msg_mock
 
     source = MagicMock()
     source.chat_id = "user@example.org"
@@ -244,9 +258,9 @@ async def test_on_processing_complete_error(fake_adapter, fake_client):
 
     await fake_adapter.on_processing_complete(event=evt, outcome=ProcessingOutcome.FAILURE)
 
-    xep0444.send_reactions.assert_called()
-    calls = xep0444.send_reactions.call_args_list
-    assert any("❌" in str(c) for c in calls)
+    # Failure sends empty (clear) then ❌
+    assert xep0444.set_reactions.call_count == 2
+    xep0444.set_reactions.assert_any_call(msg_mock, "msg-1", ["❌"])
 
 
 # ------------------------------------------------------------------
