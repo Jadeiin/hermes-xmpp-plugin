@@ -770,13 +770,13 @@ class XmppAdapter(BasePlatformAdapter):
                         mto=chat_id,
                         mbody=chunk,
                         mtype=mtype,
-                        mchat_state="active",
                     )
                 else:
                     stanza = client_local.make_message(mto=chat_id, mbody=chunk, mtype=mtype)
-                    if "xep_0085" in self._registered_plugins:
-                        stanza["chat_state"] = "active"
-                    stanza.send()
+                # Chat state (manually — make_reply's kwargs go to make_message()
+                # which does not accept mchat_state)
+                if "xep_0085" in self._registered_plugins:
+                    stanza["chat_state"] = "active"
                 # Attach XEP-0201 thread id for thread-aware clients
                 if thread_id:
                     stanza["thread"] = thread_id
@@ -788,9 +788,7 @@ class XmppAdapter(BasePlatformAdapter):
                             stanza.xml.append(markup.xml)
                     except Exception:
                         logger.debug("xmpp: failed to attach markup", exc_info=True)
-                # Reply stanzas need explicit send; regular send_message already sent
-                if chunk_reply_to and "xep_0461" in self._registered_plugins:
-                    stanza.send()
+                stanza.send()
                 try:
                     last_msg_id = stanza["id"]
                 except Exception:
