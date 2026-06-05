@@ -593,9 +593,11 @@ class XmppAdapter(BasePlatformAdapter):
                 real_jid = None
                 try:
                     if self.client is not None and "xep_0045" in self._registered_plugins:
-                        real_jid = self.client["xep_0045"].get_jid_property(
+                        jid_val = self.client["xep_0045"].get_jid_property(
                             from_bare, from_resource, "jid"
                         )
+                        if jid_val:
+                            real_jid = self._bare(str(jid_val))
                 except Exception:
                     pass
                 user_id = real_jid or self._muc_real_jid(stanza) or chat_id
