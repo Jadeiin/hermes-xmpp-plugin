@@ -828,6 +828,10 @@ class XmppAdapter(BasePlatformAdapter):
                         mbody=chunk,
                         mtype=mtype,
                     )
+                    logger.info(
+                        "xmpp: reply xml=%s",
+                        str(stanza.xml)[:400],
+                    )
                 else:
                     stanza = client_local.make_message(mto=chat_id, mbody=chunk, mtype=mtype)
                 # Chat state (manually — make_reply's kwargs go to make_message()
