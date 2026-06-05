@@ -705,10 +705,6 @@ class XmppAdapter(BasePlatformAdapter):
                         msg_id = origin_id
                 except Exception:
                     pass
-            logger.info(
-                "xmpp: inbound msg_id=%s stanza_id=%s type=%s",
-                msg_id, getattr(stanza, "get", lambda k: "N/A")("id"), stanza_type,
-            )
             event = MessageEvent(
                 text=body,
                 message_type=MessageType.TEXT,
@@ -829,10 +825,6 @@ class XmppAdapter(BasePlatformAdapter):
                         mto=chat_id,
                         mbody=chunk,
                         mtype=mtype,
-                    )
-                    logger.info(
-                        "xmpp: reply xml=%s",
-                        str(stanza.xml)[:400],
                     )
                 else:
                     stanza = client_local.make_message(mto=chat_id, mbody=chunk, mtype=mtype)
@@ -1090,10 +1082,6 @@ class XmppAdapter(BasePlatformAdapter):
                     message["reply"]["id"] = chunk_reply_to
                 except Exception:
                     logger.debug("xmpp: failed to attach reply to encrypted message", exc_info=True)
-            logger.info(
-                "xmpp: enc reply_to=%s xml=%s",
-                chunk_reply_to, str(message.xml)[:400],
-            )
             message.send()
             try:
                 last_msg_id = message["id"]
