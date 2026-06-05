@@ -803,7 +803,9 @@ class XmppAdapter(BasePlatformAdapter):
             and mtype == "chat"
         ):
             try:
-                return await self._send_encrypted(chat_id, content, thread_id=thread_id)
+                return await self._send_encrypted(
+                    chat_id, content, thread_id=thread_id, reply_to=reply_to
+                )
             except Exception as exc:
                 logger.warning(
                     "OMEMO: encryption failed for %s (%s), sending plaintext", chat_id, exc
@@ -1018,7 +1020,7 @@ class XmppAdapter(BasePlatformAdapter):
             markup.xml.append(s.xml)
         return markup if spans else None
 
-    async def _send_encrypted(self, chat_id: str, content: str, *, thread_id: Optional[str] = None) -> SendResult:
+    async def _send_encrypted(self, chat_id: str, content: str, *, thread_id: Optional[str] = None, reply_to: Optional[str] = None) -> SendResult:
         """Send an OMEMO-encrypted 1:1 chat message, split into chunks if needed."""
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
@@ -1032,6 +1034,8 @@ class XmppAdapter(BasePlatformAdapter):
         for i, chunk in enumerate(chunks):
             if i > 0:
                 await asyncio.sleep(0.3)
+            # Only the first chunk gets the reply attachment.
+            chunk_reply_to = reply_to if i == 0 else None
             stanza = client_local.make_message(mto=chat_id, mtype=mtype)
             stanza["body"] = chunk
             if thread_id:
@@ -1049,6 +1053,13 @@ class XmppAdapter(BasePlatformAdapter):
                 stanza = client_local.make_message(mto=chat_id, mbody=chunk, mtype=mtype)
                 if "xep_0085" in self._registered_plugins:
                     stanza["chat_state"] = "active"
+                # Attach XEP-0461 reply to fallback plaintext as well
+                if chunk_reply_to and "xep_0461" in self._registered_plugins:
+                    try:
+                        stanza["reply"]["to"] = JID(chat_id)
+                        stanza["reply"]["id"] = chunk_reply_to
+                    except Exception:
+                        logger.debug("xmpp: failed to attach reply to fallback stanza", exc_info=True)
                 stanza.send()
                 try:
                     last_msg_id = stanza["id"]
@@ -1072,6 +1083,13 @@ class XmppAdapter(BasePlatformAdapter):
                     message["chat_state"] = "active"
                 except Exception:
                     pass
+            # Attach XEP-0461 reply after encryption (first chunk only)
+            if chunk_reply_to and "xep_0461" in self._registered_plugins:
+                try:
+                    message["reply"]["to"] = JID(chat_id)
+                    message["reply"]["id"] = chunk_reply_to
+                except Exception:
+                    logger.debug("xmpp: failed to attach reply to encrypted message", exc_info=True)
             message.send()
             try:
                 last_msg_id = message["id"]
