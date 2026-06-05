@@ -705,6 +705,10 @@ class XmppAdapter(BasePlatformAdapter):
                         msg_id = origin_id
                 except Exception:
                     pass
+            logger.info(
+                "xmpp: inbound msg_id=%s stanza_id=%s type=%s",
+                msg_id, getattr(stanza, "get", lambda k: "N/A")("id"), stanza_type,
+            )
             event = MessageEvent(
                 text=body,
                 message_type=MessageType.TEXT,
