@@ -773,7 +773,10 @@ class XmppAdapter(BasePlatformAdapter):
                         mchat_state="active",
                     )
                 else:
-                    stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype, mchat_state="active")
+                    stanza = client_local.make_message(mto=chat_id, mbody=chunk, mtype=mtype)
+                    if "xep_0085" in self._registered_plugins:
+                        stanza["chat_state"] = "active"
+                    stanza.send()
                 # Attach XEP-0201 thread id for thread-aware clients
                 if thread_id:
                     stanza["thread"] = thread_id
@@ -984,7 +987,10 @@ class XmppAdapter(BasePlatformAdapter):
 
             if message is None:
                 logger.warning("OMEMO: nothing to encrypt, falling back to plaintext")
-                stanza = client_local.send_message(mto=chat_id, mbody=chunk, mtype=mtype, mchat_state="active")
+                stanza = client_local.make_message(mto=chat_id, mbody=chunk, mtype=mtype)
+                if "xep_0085" in self._registered_plugins:
+                    stanza["chat_state"] = "active"
+                stanza.send()
                 try:
                     last_msg_id = stanza["id"]
                 except Exception:

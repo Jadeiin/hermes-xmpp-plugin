@@ -299,7 +299,7 @@ async def test_send_clarify_falls_back_to_text(fake_adapter, fake_client):
         clarify_id="clarify-1",
         session_key="sess-1",
     )
-    fake_client.send_message.assert_called_once()
+    fake_client.make_message.assert_called_once()
     assert result.success is True
 
 
@@ -344,10 +344,10 @@ async def test_send_with_reply_to_uses_xep0461(fake_adapter, fake_client):
 
 
 @pytest.mark.asyncio
-async def test_send_without_reply_to_uses_send_message(fake_adapter, fake_client):
+async def test_send_without_reply_to_uses_make_message(fake_adapter, fake_client):
     result = await fake_adapter.send(chat_id="user@example.org", content="hello")
     assert result.success is True
-    fake_client.send_message.assert_called_once()
+    fake_client.make_message.assert_called_once()
 
 
 # ------------------------------------------------------------------

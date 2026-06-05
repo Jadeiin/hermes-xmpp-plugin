@@ -343,11 +343,11 @@ async def test_send_uses_xep_0461_when_reply_to_provided(adapter_instance):
 
 
 @pytest.mark.asyncio
-async def test_send_uses_plain_send_message_without_reply_to(adapter_instance):
+async def test_send_uses_plain_make_message_without_reply_to(adapter_instance):
     client = adapter_instance.client
     result = await adapter_instance.send(chat_id="user@example.org", content="hi")
     assert result.success is True
-    client.send_message.assert_called_once()
+    client.make_message.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -623,7 +623,7 @@ class TestThreadSupport:
         """thread_id kwarg must be set as stanza['thread']."""
         client = adapter_instance.client
         stanza = MagicMock()
-        client.send_message.return_value = stanza
+        client.make_message.return_value = stanza
         stanza.__getitem__ = lambda s, k: "msg-1" if k == "id" else None
 
         result = asyncio.run(
@@ -638,7 +638,7 @@ class TestThreadSupport:
         """thread_id from metadata dict must be used when direct param is None."""
         client = adapter_instance.client
         stanza = MagicMock()
-        client.send_message.return_value = stanza
+        client.make_message.return_value = stanza
         stanza.__getitem__ = lambda s, k: "msg-2" if k == "id" else None
 
         result = asyncio.run(
@@ -660,14 +660,14 @@ class TestMessageChunking:
         """Content under MAX_MESSAGE_LENGTH produces exactly one send."""
         client = adapter_instance.client
         stanza = MagicMock()
-        client.send_message.return_value = stanza
+        client.make_message.return_value = stanza
         stanza.__getitem__ = lambda s, k: "sid" if k == "id" else None
 
         result = asyncio.run(
             adapter_instance.send(chat_id="user@example.org", content="short msg")
         )
         assert result.success is True
-        assert client.send_message.call_count == 1
+        assert client.make_message.call_count == 1
 
     def test_long_message_splits_into_multiple_stanzas(self, adapter_instance):
         """Content over MAX_MESSAGE_LENGTH must be split into >=2 chunks."""
@@ -675,14 +675,14 @@ class TestMessageChunking:
         adapter_instance.MAX_MESSAGE_LENGTH = 50
         long_body = "x" * 120
         stanza = MagicMock()
-        client.send_message.return_value = stanza
+        client.make_message.return_value = stanza
         stanza.__getitem__ = lambda s, k: "sid" if k == "id" else None
 
         result = asyncio.run(
             adapter_instance.send(chat_id="user@example.org", content=long_body)
         )
         assert result.success is True
-        assert client.send_message.call_count >= 2
+        assert client.make_message.call_count >= 2
 
     def test_max_message_length_configurable(self):
         """MAX_MESSAGE_LENGTH must be settable on the adapter class."""
