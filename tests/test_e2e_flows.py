@@ -40,7 +40,8 @@ sys.modules["gateway.platforms.base"] = gw_base
 
 class _FakeMessageEvent:
     def __init__(self, *, text="", message_type=None, source=None, raw_message=None,
-                 message_id=None, reply_to_message_id=None, reply_to_text=None, metadata=None):
+                 message_id=None, reply_to_message_id=None, reply_to_text=None, metadata=None,
+                 media_urls=None, media_types=None):
         self.text = text
         self.message_type = message_type
         self.source = source
@@ -49,9 +50,11 @@ class _FakeMessageEvent:
         self.reply_to_message_id = reply_to_message_id
         self.reply_to_text = reply_to_text
         self.metadata = metadata or {}
+        self.media_urls = media_urls or []
+        self.media_types = media_types or []
 
 gw_base.MessageEvent = _FakeMessageEvent
-gw_base.MessageType = type("MessageType", (), {"TEXT": "text", "IMAGE": "image", "COMMAND": "command"})
+gw_base.MessageType = type("MessageType", (), {"TEXT": "text", "IMAGE": "image", "COMMAND": "command", "VOICE": "voice"})
 
 class _FakeProcessingOutcome:
     SUCCESS = 0
@@ -62,6 +65,12 @@ gw_base.ProcessingOutcome = _FakeProcessingOutcome
 gw_base.SendResult = type("SendResult", (), {
     "__init__": lambda s, **kw: s.__dict__.update(kw) or None,
 })
+
+# Mock cache_audio_from_url for tests (no real HTTP)
+async def _mock_cache_audio_from_url(url: str, ext: str = ".ogg") -> str:
+    return f"/tmp/mock_audio{ext}"
+
+gw_base.cache_audio_from_url = _mock_cache_audio_from_url
 
 # Track calls into BasePlatformAdapter for assertions
 captured_handle_calls = []

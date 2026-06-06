@@ -56,9 +56,31 @@ from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
     MessageType,
     ProcessingOutcome,
     SendResult,
+    cache_audio_from_url,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------
+# MIME → extension mapping for inbound media downloads
+# ----------------------------------------------------------------
+_MIME_TO_EXT: Dict[str, str] = {
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/wav": ".wav",
+    "audio/webm": ".weba",
+    "audio/x-m4a": ".m4a",
+}
+
+
+def _mime_to_ext(mime: str) -> str:
+    """Map a MIME type to a file extension (including the dot)."""
+    return _MIME_TO_EXT.get(mime, ".ogg")
 
 
 # ----------------------------------------------------------------
@@ -612,7 +634,64 @@ class XmppAdapter(BasePlatformAdapter):
                         logger.warning("OMEMO: failed to decrypt message from %s: %s", from_bare, exc)
                         return
 
-            if not body:
+            # ── Inbound Voice / Media Extraction ──────────────────────
+            # XEP-0447 SFS (Stateless File Sharing) or XEP-0066 OOB
+            media_urls: List[str] = []
+            media_types: List[str] = []
+            message_type = MessageType.TEXT
+
+            try:
+                # SFS (XEP-0447) — primary path for modern clients
+                sfs_urls: List[str] = []
+                sfs_media: Optional[str] = None
+                if "xep_0447" in self._registered_plugins:
+                    try:
+                        sfs_el = stanza_to_dispatch["sfs"]
+                        if sfs_el and sfs_el.xml is not None:
+                            for url_data in sfs_el["sources"]:
+                                target = url_data["target"]
+                                if target:
+                                    sfs_urls.append(str(target))
+                            # media-type from optional <file> metadata
+                            try:
+                                sfs_media = sfs_el["file"]["media-type"] or None
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass  # no SFS element or plugin not active
+
+                for url in sfs_urls:
+                    try:
+                        mime = sfs_media or "audio/ogg"
+                        ext = _mime_to_ext(mime)
+                        cached = await cache_audio_from_url(url, ext=ext)
+                        media_urls.append(cached)
+                        media_types.append(mime)
+                        logger.info("xmpp: cached SFS audio from %s → %s", url, cached)
+                    except Exception as exc:
+                        logger.warning("xmpp: failed to download SFS audio %s: %s", url, exc)
+
+                # OOB (XEP-0066) — fallback for older clients
+                if not sfs_urls and "xep_0066" in self._registered_plugins:
+                    try:
+                        oob_url = stanza_to_dispatch["oob"]["url"]
+                        if oob_url:
+                            mime = "audio/ogg"
+                            ext = _mime_to_ext(mime)
+                            cached = await cache_audio_from_url(str(oob_url), ext=ext)
+                            media_urls.append(cached)
+                            media_types.append(mime)
+                            logger.info("xmpp: cached OOB audio from %s → %s", oob_url, cached)
+                    except Exception:
+                        pass  # no OOB element
+
+                # Classify as VOICE when audio media is present
+                if media_urls and any(mt.startswith("audio/") for mt in media_types):
+                    message_type = MessageType.VOICE
+            except Exception:
+                logger.debug("xmpp: media extraction skipped", exc_info=True)
+
+            if not body and not media_urls:
                 return
 
             if stanza_type == "groupchat":
@@ -630,6 +709,14 @@ class XmppAdapter(BasePlatformAdapter):
                             real_jid = self._bare(str(jid_val))
                 except Exception:
                     pass
+                # Drop own echoed MUC messages (server reflects bot's messages back)
+                if real_jid and real_jid == self._self_bare:
+                    return
+                if from_resource:
+                    our_nick = self._muc_nick_for_room(from_bare)
+                    if our_nick and from_resource == our_nick:
+                        return
+
                 user_id = real_jid or self._muc_real_jid(stanza) or chat_id
                 if real_jid:
                     logger.debug("xmpp: MUC real JID from roster: %s → %s", from_resource, real_jid)
@@ -707,16 +794,29 @@ class XmppAdapter(BasePlatformAdapter):
                     pass
             event = MessageEvent(
                 text=body,
-                message_type=MessageType.TEXT,
+                message_type=message_type,
                 source=source,
                 raw_message=stanza_to_dispatch,
                 message_id=msg_id,
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
+                media_urls=media_urls,
+                media_types=media_types,
             )
             await self.handle_message(event)
         except Exception:
             logger.exception("xmpp: error handling inbound stanza")
+
+    # ------------------------------------------------------------------
+    # Auth / nick helpers
+    # ------------------------------------------------------------------
+
+    def _muc_nick_for_room(self, room_jid: str) -> Optional[str]:
+        """Return the bot's nick for a given MUC room, or None if unknown."""
+        for room_config in self.muc_rooms:
+            if room_config.room == room_jid:
+                return room_config.nick or self.muc_nick
+        return self.muc_nick  # fallback: default nick
 
     def _muc_real_jid(self, stanza: Any) -> Optional[str]:
         """Extract the real JID from a MUC stanza's <x> element.
