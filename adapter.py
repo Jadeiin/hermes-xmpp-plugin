@@ -439,6 +439,22 @@ class XmppAdapter(BasePlatformAdapter):
         self._pending_reactions: Dict[str, Any] = {}
         self._reactions_enabled: bool = os.getenv("XMPP_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+        # Reaction-based dangerous command approvals (cf. Matrix send_exec_approval)
+        self._approval_reaction_map = {
+            "✅": "once",
+            "❎": "deny",
+        }
+        self._approval_prompts_by_event: Dict[str, dict] = {}
+        self._approval_prompt_by_session: Dict[str, str] = {}
+
+        # Command prefix detection: messages starting with any of these
+        # are flagged as MessageType.COMMAND.  Configurable via
+        # XMPP_COMMAND_PREFIXES env var (comma-separated, e.g. "/,!,#").
+        raw_prefixes = os.getenv("XMPP_COMMAND_PREFIXES", "/,!")
+        self._command_prefixes: tuple[str, ...] = tuple(
+            p.strip() for p in raw_prefixes.split(",") if p.strip()
+        )
+
         # MAM (XEP-0313) state — in-memory only (aligns with Telegram's
         # drop_pending_updates pattern; survives Phase 1 reconnect but
         # intentionally resets on Phase 2 gateway watcher restart).
@@ -525,6 +541,11 @@ class XmppAdapter(BasePlatformAdapter):
         client.add_event_handler("message", self._on_message)
         client.add_event_handler("disconnected", self._on_disconnected)
         client.add_event_handler("failed_auth", self._on_failed_auth)
+        # XEP-0444: slixmpp fires 'reactions' event for inbound reactions.
+        # Use this instead of manual stanza parsing — it carries the full
+        # Message with parsed Reactions data.
+        if "xep_0444" in self._registered_plugins:
+            client.add_event_handler("reactions", self._on_reaction)
         # XEP-0198 Stream Management — log state transitions
         if "xep_0198" in self._registered_plugins:
             client.add_event_handler("sm_enabled", self._on_sm_enabled)
@@ -838,7 +859,7 @@ class XmppAdapter(BasePlatformAdapter):
                             cached = await cache_audio_from_url(url, ext=ext)
                         media_urls.append(cached)
                         media_types.append(mime)
-                        logger.info("xmpp: cached SFS media (%s) from %s → %s", mime, url, cached)
+                        logger.debug("xmpp: cached SFS media (%s) from %s → %s", mime, url, cached)
                     except Exception as exc:
                         logger.warning("xmpp: failed to download SFS media %s: %s", url, exc)
 
@@ -856,7 +877,7 @@ class XmppAdapter(BasePlatformAdapter):
                                 cached = await cache_audio_from_url(url_str, ext=ext)
                             media_urls.append(cached)
                             media_types.append(mime)
-                            logger.info("xmpp: cached OOB media (%s) from %s → %s", mime, url_str, cached)
+                            logger.debug("xmpp: cached OOB media (%s) from %s → %s", mime, url_str, cached)
                     except Exception:
                         pass  # no OOB element
 
@@ -920,8 +941,25 @@ class XmppAdapter(BasePlatformAdapter):
                 parts.append(
                     f"latitude: {geoloc_data['lat']}, longitude: {geoloc_data['lon']}"
                 )
+                location_text = "\n".join(parts)
                 if not body:
-                    body = "\n".join(parts)
+                    body = location_text
+                elif body.strip().startswith("geo:"):
+                    # Strip the geo: URI, keep any user text after it
+                    remaining = re.sub(
+                        r"^geo:-?\d+\.?\d*,-?\d+\.?\d*\s*",
+                        "", body.strip(),
+                    ).strip()
+                    if remaining:
+                        body = remaining + "\n\n" + location_text
+                    else:
+                        body = location_text
+                else:
+                    body = body + "\n\n" + location_text
+
+            # ── Command detection ────────────────────────────────────
+            if body and body.strip().startswith(self._command_prefixes):
+                message_type = MessageType.COMMAND
 
             if not body and not media_urls:
                 return
@@ -1181,7 +1219,7 @@ class XmppAdapter(BasePlatformAdapter):
                         await self._mam_dispatch_forwarded(mam_msg)
                         count += 1
                     if count:
-                        logger.info(
+                        logger.debug(
                             "xmpp: MAM replayed %d DM messages (since %s)",
                             count, self._mam_last_dm.isoformat(),
                         )
@@ -1218,7 +1256,7 @@ class XmppAdapter(BasePlatformAdapter):
                         await self._mam_dispatch_forwarded(mam_msg)
                         count += 1
                     if count:
-                        logger.info(
+                        logger.debug(
                             "xmpp: MAM replayed %d messages from %s (since %s)",
                             count, room_jid, last_ts.isoformat(),
                         )
@@ -1234,7 +1272,7 @@ class XmppAdapter(BasePlatformAdapter):
                 self._mam_last_rooms[room.room] = cutoff
 
             if total_replayed:
-                logger.info("xmpp: MAM catch-up complete — %d total messages replayed", total_replayed)
+                logger.debug("xmpp: MAM catch-up complete — %d total messages replayed", total_replayed)
 
         except Exception:
             logger.exception("xmpp: MAM catch-up failed")
@@ -1420,7 +1458,7 @@ class XmppAdapter(BasePlatformAdapter):
                     recipient_jid = JID(chat_id)
                     encrypted, errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
                     if errors:
-                        logger.info("OMEMO: edit encryption non-critical errors: %s", errors)
+                        logger.debug("OMEMO: edit encryption non-critical errors: %s", errors)
                     if encrypted is not None:
                         stanza = encrypted
                         # encrypt_message clear()s the stanza and rebuilds with only
@@ -1564,7 +1602,7 @@ class XmppAdapter(BasePlatformAdapter):
             message, encryption_errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
 
             if encryption_errors:
-                logger.info("OMEMO: encryption non-critical errors: %s", encryption_errors)
+                logger.debug("OMEMO: encryption non-critical errors: %s", encryption_errors)
 
             if message is None:
                 logger.warning("OMEMO: nothing to encrypt, falling back to plaintext")
@@ -1639,6 +1677,185 @@ class XmppAdapter(BasePlatformAdapter):
             msg.send()
         except Exception:
             logger.debug("xmpp: stop_typing failed", exc_info=True)
+
+    # ── Inbound reaction handler (slixmpp 'reactions' event) ─────
+    def _on_reaction(self, message) -> None:
+        """Handle inbound XEP-0444 reactions via slixmpp's 'reactions' event.
+
+        The XEP-0444 plugin fires this event with a fully parsed Message
+        stanza.  We extract the target message ID and reaction value,
+        then check if it resolves a pending exec-approval prompt.
+        """
+        try:
+            from_full = str(message["from"])
+            from_bare = self._bare(from_full)
+        except Exception:
+            return
+
+        if from_bare == self._self_bare:
+            return  # ignore own reactions
+
+        try:
+            reactions_el = message["reactions"]
+            if reactions_el is None or reactions_el.xml is None:
+                return
+            target_id = reactions_el["id"]
+            for rxn in reactions_el:
+                try:
+                    rxn_val = str(rxn["value"])
+                    if not rxn_val:
+                        continue
+                except Exception:
+                    continue
+
+                logger.debug(
+                    "xmpp: inbound reaction %s on %s from %s",
+                    rxn_val, target_id, from_bare,
+                )
+
+                # Check approval map
+                prompt = self._approval_prompts_by_event.get(target_id)
+                if not prompt or prompt.get("resolved"):
+                    logger.debug(
+                        "xmpp: reaction on %s — no pending approval (prompt=%s)",
+                        target_id, bool(prompt),
+                    )
+                    continue
+
+                choice = self._approval_reaction_map.get(rxn_val)
+                logger.debug(
+                    "xmpp: reaction on approval msg — choice=%s", choice,
+                )
+                if not choice:
+                    continue
+
+                if not self._is_authorized(
+                    chat_type="dm", chat_id=from_bare, user_jid=from_bare
+                ):
+                    logger.debug(
+                        "xmpp: ignoring approval reaction from unauthorized %s",
+                        from_bare,
+                    )
+                    continue
+
+                try:
+                    from tools.approval import resolve_gateway_approval
+
+                    count = resolve_gateway_approval(
+                        prompt["session_key"], choice
+                    )
+                    if count:
+                        prompt["resolved"] = True
+                        self._approval_prompts_by_event.pop(target_id, None)
+                        self._approval_prompt_by_session.pop(
+                            prompt["session_key"], None
+                        )
+                        logger.debug(
+                            "xmpp: reaction resolved %d approval(s) for "
+                            "session %s (choice=%s, user=%s)",
+                            count, prompt["session_key"], choice, from_bare,
+                        )
+                        # Clean up bot's seed reactions
+                        asyncio.ensure_future(
+                            self._cleanup_approval_reactions(
+                                prompt["chat_id"], prompt
+                            )
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "xmpp: failed to resolve gateway approval from "
+                        "reaction: %s", exc
+                    )
+        except Exception:
+            logger.debug("xmpp: _on_reaction error", exc_info=True)
+
+    # ── Reaction-based exec approval ──────────────────────────
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[dict] = None,
+    ) -> SendResult:
+        """Send a reaction-based exec approval prompt for XMPP.
+        
+        Posts a warning message with ✅/❎ reactions. When the user
+        clicks a reaction, the inbound reaction handler resolves
+        the pending gateway approval.
+        """
+        if not self.client or "xep_0444" not in self._registered_plugins:
+            return SendResult(success=False, error="Not connected or reactions unavailable")
+
+        cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
+        text = (
+            "⚠️ **Dangerous command requires approval**\n"
+            f"```\n{cmd_preview}\n```\n"
+            f"Reason: {description}\n\n"
+            "Reply `/approve` to execute, `/approve session` to approve this "
+            "pattern for the session, `/approve always` to approve permanently, "
+            "or `/deny` to cancel.\n\n"
+            "You can also tap the reaction to approve:\n"
+            "✅ = /approve\n"
+            "❎ = /deny"
+        )
+
+        result = await self.send(chat_id, text, metadata=metadata)
+        if not result.success or not result.message_id:
+            return result
+
+        prompt = {
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "message_id": result.message_id,
+            "resolved": False,
+            "bot_reaction_message_ids": {},
+        }
+        old_event = self._approval_prompt_by_session.get(session_key)
+        if old_event:
+            self._approval_prompts_by_event.pop(old_event, None)
+        self._approval_prompts_by_event[result.message_id] = prompt
+        self._approval_prompt_by_session[session_key] = result.message_id
+
+        # Send BOTH reactions in ONE message — set_reactions REPLACES,
+        # not appends.  Sending separately would leave only the last one.
+        try:
+            mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+            msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
+            self.client["xep_0444"].set_reactions(
+                msg, result.message_id, ["✅", "❎"]
+            )
+            msg.enable("store")
+            msg.send()
+        except Exception as exc:
+            logger.debug(
+                "xmpp: failed to add approval reactions: %s", exc
+            )
+
+        return result
+
+    async def _cleanup_approval_reactions(
+        self, chat_id: str, prompt: dict
+    ) -> None:
+        """Remove bot's seed reactions after approval is resolved."""
+        if not self.client or "xep_0444" not in self._registered_plugins:
+            return
+        try:
+            mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+            msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
+            self.client["xep_0444"].set_reactions(
+                msg, prompt["message_id"], []
+            )
+            msg.enable("store")
+            msg.send()
+            logger.debug(
+                "xmpp: cleared bot approval reactions on %s",
+                prompt["message_id"],
+            )
+        except Exception as exc:
+            logger.debug(
+                "xmpp: failed to clear bot approval reactions: %s", exc
+            )
 
     async def send_image_file(
         self,
