@@ -57,6 +57,7 @@ from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
     ProcessingOutcome,
     SendResult,
     cache_audio_from_url,
+    cache_image_from_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,7 @@ logger = logging.getLogger(__name__)
 # MIME → extension mapping for inbound media downloads
 # ----------------------------------------------------------------
 _MIME_TO_EXT: Dict[str, str] = {
+    # Audio
     "audio/ogg": ".ogg",
     "audio/opus": ".opus",
     "audio/mpeg": ".mp3",
@@ -75,12 +77,105 @@ _MIME_TO_EXT: Dict[str, str] = {
     "audio/wav": ".wav",
     "audio/webm": ".weba",
     "audio/x-m4a": ".m4a",
+    # Image
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/svg+xml": ".svg",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    # Video
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/ogg": ".ogv",
+    "video/quicktime": ".mov",
+    "video/x-matroska": ".mkv",
+    # Documents
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "application/gzip": ".gz",
+    "application/x-tar": ".tar",
+    "text/plain": ".txt",
+    "text/html": ".html",
 }
 
 
 def _mime_to_ext(mime: str) -> str:
     """Map a MIME type to a file extension (including the dot)."""
-    return _MIME_TO_EXT.get(mime, ".ogg")
+    return _MIME_TO_EXT.get(mime, ".bin")
+
+
+def _mime_to_message_type(mime: str, *, body: Optional[str] = None) -> MessageType:
+    """Map a MIME type to the appropriate MessageType.
+
+    When body is empty and the media is audio, treat it as a voice note
+    regardless of the exact codec — the "media-only audio" pattern is the
+    de-facto voice-message signal across Conversations, Gajim, and most
+    modern XMPP clients (which use .ogg, .m4a, .aac, .opus, etc.).
+    """
+    mime_lower = mime.lower()
+    if mime_lower.startswith("image/"):
+        return MessageType.PHOTO
+    if mime_lower.startswith("video/"):
+        return MessageType.VIDEO
+    if mime_lower.startswith("audio/"):
+        # Known voice-message codecs (Conversations & friends)
+        if mime_lower in (
+            "audio/ogg",       # Opus in Ogg (Conversations "OGG" setting)
+            "audio/opus",      # raw Opus
+            "audio/mp4",       # AAC in MP4 (.m4a — Conversations "AAC" setting)
+            "audio/aac",       # raw AAC
+            "audio/x-m4a",     # legacy .m4a
+        ):
+            return MessageType.VOICE
+        # Body-less audio → almost certainly a voice note
+        if body is not None and not (body or "").strip():
+            return MessageType.VOICE
+        return MessageType.AUDIO
+    return MessageType.DOCUMENT
+
+
+def _guess_mime_from_url(url: str) -> str:
+    """Guess MIME type from a URL's file extension."""
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path.lower()
+    ext_to_mime = {
+        # Audio
+        ".ogg": "audio/ogg",
+        ".opus": "audio/opus",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".wav": "audio/wav",
+        ".weba": "audio/webm",
+        # Image
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".svg": "image/svg+xml",
+        ".bmp": "image/bmp",
+        # Video
+        ".mp4": "video/mp4",
+        ".webm": "video/webm",
+        ".ogv": "video/ogg",
+        ".mov": "video/quicktime",
+        ".mkv": "video/x-matroska",
+        # Documents
+        ".pdf": "application/pdf",
+        ".zip": "application/zip",
+        ".gz": "application/gzip",
+        ".tar": "application/x-tar",
+        ".txt": "text/plain",
+        ".html": "text/html",
+    }
+    for ext, mime in ext_to_mime.items():
+        if path.endswith(ext):
+            return mime
+    return "application/octet-stream"
 
 
 # ----------------------------------------------------------------
@@ -345,7 +440,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         client = ClientXMPP(self.jid, self._password)
         # Plugins - core
-        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0199", "xep_0363"):
+        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0198", "xep_0199", "xep_0363"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -390,6 +485,12 @@ class XmppAdapter(BasePlatformAdapter):
         client.add_event_handler("message", self._on_message)
         client.add_event_handler("disconnected", self._on_disconnected)
         client.add_event_handler("failed_auth", self._on_failed_auth)
+        # XEP-0198 Stream Management — log state transitions
+        if "xep_0198" in self._registered_plugins:
+            client.add_event_handler("sm_enabled", self._on_sm_enabled)
+            client.add_event_handler("session_resumed", self._on_sm_resumed)
+            client.add_event_handler("sm_failed", self._on_sm_failed)
+            client.add_event_handler("sm_disabled", self._on_sm_disabled)
 
         self.client = client
         self._session_ready = asyncio.Event()
@@ -537,7 +638,7 @@ class XmppAdapter(BasePlatformAdapter):
             # Stale event after client cleanup — nothing to reconnect.
             return
         logger.warning(
-            "xmpp: unexpected disconnect — attempting reconnect via slixmpp"
+            "xmpp: unexpected disconnect — attempting slixmpp reconnect (SM resume if XEP-0198 active)"
         )
         self._reconnecting = True
         try:
@@ -557,6 +658,24 @@ class XmppAdapter(BasePlatformAdapter):
             "XMPP authentication failed — check XMPP_JID/XMPP_PASSWORD",
             retryable=False,
         )
+
+    # ── XEP-0198 Stream Management handlers ─────────────────────────
+
+    def _on_sm_enabled(self, _event: Any) -> None:
+        logger.info("xmpp: Stream Management (XEP-0198) enabled — stanzas will be acked")
+
+    def _on_sm_resumed(self, _event: Any) -> None:
+        """Session resumed after reconnect — unacked stanzas replayed."""
+        logger.info("xmpp: SM session resumed — unacked stanzas replayed")
+
+    def _on_sm_failed(self, _event: Any) -> None:
+        """SM enable/resume failed — server may not support it."""
+        logger.warning("xmpp: SM enable/resume failed — server may not support XEP-0198")
+
+    def _on_sm_disabled(self, _event: Any) -> None:
+        logger.debug("xmpp: SM disabled (connection lost or session ended)")
+
+    # ── OMEMO ───────────────────────────────────────────────────────
 
     async def _on_omemo_initialized(self, _event: Any) -> None:
         logger.info("OMEMO: initialized")
@@ -662,32 +781,39 @@ class XmppAdapter(BasePlatformAdapter):
 
                 for url in sfs_urls:
                     try:
-                        mime = sfs_media or "audio/ogg"
+                        mime = sfs_media or _guess_mime_from_url(url)
                         ext = _mime_to_ext(mime)
-                        cached = await cache_audio_from_url(url, ext=ext)
+                        if mime.startswith("image/"):
+                            cached = await cache_image_from_url(url, ext=ext)
+                        else:
+                            cached = await cache_audio_from_url(url, ext=ext)
                         media_urls.append(cached)
                         media_types.append(mime)
-                        logger.info("xmpp: cached SFS audio from %s → %s", url, cached)
+                        logger.info("xmpp: cached SFS media (%s) from %s → %s", mime, url, cached)
                     except Exception as exc:
-                        logger.warning("xmpp: failed to download SFS audio %s: %s", url, exc)
+                        logger.warning("xmpp: failed to download SFS media %s: %s", url, exc)
 
                 # OOB (XEP-0066) — fallback for older clients
                 if not sfs_urls and "xep_0066" in self._registered_plugins:
                     try:
                         oob_url = stanza_to_dispatch["oob"]["url"]
                         if oob_url:
-                            mime = "audio/ogg"
+                            url_str = str(oob_url)
+                            mime = _guess_mime_from_url(url_str)
                             ext = _mime_to_ext(mime)
-                            cached = await cache_audio_from_url(str(oob_url), ext=ext)
+                            if mime.startswith("image/"):
+                                cached = await cache_image_from_url(url_str, ext=ext)
+                            else:
+                                cached = await cache_audio_from_url(url_str, ext=ext)
                             media_urls.append(cached)
                             media_types.append(mime)
-                            logger.info("xmpp: cached OOB audio from %s → %s", oob_url, cached)
+                            logger.info("xmpp: cached OOB media (%s) from %s → %s", mime, url_str, cached)
                     except Exception:
                         pass  # no OOB element
 
-                # Classify as VOICE when audio media is present
-                if media_urls and any(mt.startswith("audio/") for mt in media_types):
-                    message_type = MessageType.VOICE
+                # Classify media type
+                if media_urls:
+                    message_type = _mime_to_message_type(media_types[0], body=body)
             except Exception:
                 logger.debug("xmpp: media extraction skipped", exc_info=True)
 
