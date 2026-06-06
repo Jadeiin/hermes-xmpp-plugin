@@ -21,6 +21,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
@@ -432,6 +433,14 @@ class XmppAdapter(BasePlatformAdapter):
         self._pending_reactions: Dict[str, Any] = {}
         self._reactions_enabled: bool = os.getenv("XMPP_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+        # MAM (XEP-0313) state — replay missed messages after reconnect
+        self._mam_enabled: bool = False
+        self._mam_replaying: bool = False
+        self._mam_state_dir = Path(__file__).parent / "data"
+        self._mam_state_path = self._mam_state_dir / "mam.json"
+        self._mam_last_dm: Optional[datetime] = None
+        self._mam_last_rooms: Dict[str, datetime] = {}
+
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
@@ -451,7 +460,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
         # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
-        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359", "xep_0333", "xep_0372"):
+        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359", "xep_0333", "xep_0372", "xep_0313"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -476,6 +485,12 @@ class XmppAdapter(BasePlatformAdapter):
             logger.debug("xmpp: re-registered XEP-0372 Reference as iterable")
         except Exception:
             logger.debug("xmpp: XEP-0372 Reference stanza not available")
+
+        # MAM (XEP-0313) — load persisted state for catch-up after reconnect
+        if "xep_0313" in self._registered_plugins:
+            self._mam_enabled = True
+            self._mam_load_state()
+            logger.debug("xmpp: MAM (XEP-0313) enabled — will replay missed messages after reconnect")
 
         # OMEMO plugin registration
         omemo_ok = False
@@ -613,6 +628,8 @@ class XmppAdapter(BasePlatformAdapter):
         if self.client is None:
             return
 
+        was_reconnecting = self._reconnecting
+
         # Handle successful reconnection
         if self._reconnecting:
             self._reconnecting = False
@@ -636,6 +653,13 @@ class XmppAdapter(BasePlatformAdapter):
             await self._setup_adhoc_commands()
         except Exception:
             logger.debug("xmpp: ad-hoc command setup failed", exc_info=True)
+
+        # MAM (XEP-0313) catch-up: replay messages missed during disconnect.
+        # Fires as a background task to avoid blocking session startup.
+        # SM resume (XEP-0198) may have already replayed some messages — the
+        # timestamp-based dedup ensures no duplicates.
+        if self._mam_enabled and was_reconnecting:
+            asyncio.create_task(self._mam_catch_up())
 
     def _on_disconnected(self, _event: Any) -> None:
         """Synchronous handler — must NOT be async.
@@ -1028,8 +1052,16 @@ class XmppAdapter(BasePlatformAdapter):
             )
             await self.handle_message(event)
 
+            # ── MAM timestamp tracking ───────────────────────────────
+            # Update last-seen time so future MAM catch-up queries only
+            # fetch messages after this point.  Skip during MAM replay
+            # (historical messages should not advance the timestamp).
+            if not self._mam_replaying:
+                self._mam_update_timestamp(chat_type, chat_id)
+
             # ── XEP-0333 Chat Marker: acknowledge as displayed ──────
-            if msg_id and from_full and "xep_0333" in self._registered_plugins and self.client is not None:
+            # Skip for MAM-replayed (historical) messages.
+            if not self._mam_replaying and msg_id and from_full and "xep_0333" in self._registered_plugins and self.client is not None:
                 try:
                     mtype = "groupchat" if stanza_type == "groupchat" else "chat"
                     self.client["xep_0333"].send_marker(
@@ -1083,6 +1115,180 @@ class XmppAdapter(BasePlatformAdapter):
         if not self.allowed_users:
             return True  # No allowlist → delegate to gateway pairing system
         return self._bare(user_jid) in self.allowed_users
+
+    # -----------------------------------------------------------------
+    # MAM (XEP-0313) — Message Archive Management
+    # -----------------------------------------------------------------
+
+    def _mam_load_state(self) -> None:
+        """Load persisted MAM timestamps from disk."""
+        try:
+            if self._mam_state_path.exists():
+                data = json.loads(self._mam_state_path.read_text())
+                if "last_dm" in data:
+                    self._mam_last_dm = datetime.fromisoformat(data["last_dm"])
+                if "rooms" in data:
+                    for room_jid, ts_str in data["rooms"].items():
+                        self._mam_last_rooms[room_jid] = datetime.fromisoformat(ts_str)
+                logger.debug(
+                    "xmpp: MAM state loaded — DM: %s, rooms: %d",
+                    self._mam_last_dm.isoformat() if self._mam_last_dm else "none",
+                    len(self._mam_last_rooms),
+                )
+        except Exception:
+            logger.debug("xmpp: MAM state load failed", exc_info=True)
+
+    def _mam_save_state(self) -> None:
+        """Persist MAM timestamps to disk."""
+        try:
+            self._mam_state_dir.mkdir(parents=True, exist_ok=True)
+            data: Dict[str, Any] = {}
+            if self._mam_last_dm is not None:
+                data["last_dm"] = self._mam_last_dm.isoformat()
+            if self._mam_last_rooms:
+                data["rooms"] = {
+                    room: ts.isoformat()
+                    for room, ts in self._mam_last_rooms.items()
+                }
+            self._mam_state_path.write_text(json.dumps(data, indent=2))
+        except Exception:
+            logger.debug("xmpp: MAM state save failed", exc_info=True)
+
+    def _mam_update_timestamp(self, chat_type: str, chat_id: str) -> None:
+        """Update the MAM last-seen timestamp after processing a message."""
+        if not self._mam_enabled:
+            return
+        now = datetime.now(timezone.utc)
+        if chat_type == "dm":
+            self._mam_last_dm = now
+        else:
+            self._mam_last_rooms[chat_id] = now
+        self._mam_save_state()
+
+    async def _mam_catch_up(self) -> None:
+        """Replay missed messages from the server archive after reconnect.
+
+        Queries the user's DM archive and each joined MUC room's archive
+        for messages sent between the last known timestamp and now.
+        Dispatches each forwarded stanza through the normal message handler.
+
+        Called as a background task from _on_session_start — does not
+        block session startup.
+        """
+        if self.client is None or "xep_0313" not in self._registered_plugins:
+            return
+
+        self._mam_replaying = True
+        try:
+            cutoff = datetime.now(timezone.utc)
+            total_replayed = 0
+
+            # ── DM archive ──────────────────────────────────────────
+            if self._mam_last_dm is not None:
+                try:
+                    count = 0
+                    async for mam_msg in self.client["xep_0313"].iterate(
+                        start=self._mam_last_dm,
+                        end=cutoff,
+                        reverse=False,
+                        total=50,  # safety cap — don't replay too many old messages
+                    ):
+                        await self._mam_dispatch_forwarded(mam_msg)
+                        count += 1
+                    if count:
+                        logger.info(
+                            "xmpp: MAM replayed %d DM messages (since %s)",
+                            count, self._mam_last_dm.isoformat(),
+                        )
+                        total_replayed += count
+                except Exception:
+                    logger.debug("xmpp: MAM DM query failed", exc_info=True)
+
+            # ── MUC archives ────────────────────────────────────────
+            # Small delay to allow MUC join presence to be processed
+            # by the server before querying room archives.
+            if self.muc_rooms and any(
+                self._mam_last_rooms.get(r.room) is not None
+                for r in self.muc_rooms
+            ):
+                await asyncio.sleep(1.0)
+
+            for room in self.muc_rooms:
+                room_jid = room.room
+                last_ts = self._mam_last_rooms.get(room_jid)
+                if last_ts is None:
+                    # First connect for this room — set timestamp so we
+                    # don't replay old history on the next reconnect.
+                    self._mam_last_rooms[room_jid] = cutoff
+                    continue
+                try:
+                    count = 0
+                    async for mam_msg in self.client["xep_0313"].iterate(
+                        jid=JID(room_jid),
+                        start=last_ts,
+                        end=cutoff,
+                        reverse=False,
+                        total=50,
+                    ):
+                        await self._mam_dispatch_forwarded(mam_msg)
+                        count += 1
+                    if count:
+                        logger.info(
+                            "xmpp: MAM replayed %d messages from %s (since %s)",
+                            count, room_jid, last_ts.isoformat(),
+                        )
+                        total_replayed += count
+                except Exception:
+                    logger.debug(
+                        "xmpp: MAM query for %s failed", room_jid, exc_info=True,
+                    )
+
+            # ── Update timestamps ───────────────────────────────────
+            self._mam_last_dm = cutoff
+            for room in self.muc_rooms:
+                self._mam_last_rooms[room.room] = cutoff
+            self._mam_save_state()
+
+            if total_replayed:
+                logger.info("xmpp: MAM catch-up complete — %d total messages replayed", total_replayed)
+
+        except Exception:
+            logger.exception("xmpp: MAM catch-up failed")
+        finally:
+            self._mam_replaying = False
+
+    async def _mam_dispatch_forwarded(
+        self,
+        mam_message: Any,
+    ) -> None:
+        """Extract and dispatch a forwarded stanza from a MAM result.
+
+        MAM results wrap the original message in:
+          <result xmlns='urn:xmpp:mam:2'>
+            <forwarded xmlns='urn:xmpp:forward:0'>
+              <delay stamp='...'/>
+              <message ...>original stanza</message>
+            </forwarded>
+          </result>
+
+        The slixmpp MAM plugin's register_stanza_plugin chain wires up
+        the stanza types so that forwarded['stanza'] returns the original
+        Message object ready for dispatch through _on_message.
+        """
+        try:
+            result = mam_message["mam_result"]
+            forwarded = result["forwarded"]
+            original_stanza = forwarded["stanza"]
+
+            if not isinstance(original_stanza, Message):
+                return
+
+            # Dispatch through normal message handler — it will extract
+            # from/to/type/body from the original stanza and route to
+            # the gateway as if the message just arrived.
+            await self._on_message(original_stanza)
+        except Exception:
+            logger.debug("xmpp: MAM dispatch failed", exc_info=True)
 
     # -----------------------------------------------------------------
     # Outbound
