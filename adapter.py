@@ -449,7 +449,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
         # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
-        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359"):
+        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359", "xep_0333", "xep_0372"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -817,6 +817,47 @@ class XmppAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("xmpp: media extraction skipped", exc_info=True)
 
+            # ── Inbound GeoLoc (XEP-0080) ────────────────────────────
+            # Parse <geoloc xmlns='http://jabber.org/protocol/geoloc'> in message
+            geoloc_data: Optional[Dict[str, str]] = None
+            if not media_urls:
+                try:
+                    geoloc_el = stanza_to_dispatch.xml.find(
+                        "{http://jabber.org/protocol/geoloc}geoloc"
+                    )
+                    if geoloc_el is not None:
+                        lat = None
+                        lon = None
+                        desc = None
+                        for child in geoloc_el:
+                            tag = child.tag.split("}", 1)[-1] if "}" in child.tag else child.tag
+                            text = (child.text or "").strip()
+                            if tag == "lat":
+                                lat = text
+                            elif tag == "lon":
+                                lon = text
+                            elif tag == "description":
+                                desc = text
+                        if lat and lon:
+                            geoloc_data = {
+                                "lat": lat,
+                                "lon": lon,
+                                "description": desc or "",
+                            }
+                except Exception:
+                    pass
+
+            if geoloc_data:
+                message_type = MessageType.LOCATION
+                parts = ["[The user shared a location pin.]"]
+                if geoloc_data["description"]:
+                    parts.append(f"Description: {geoloc_data['description']}")
+                parts.append(
+                    f"latitude: {geoloc_data['lat']}, longitude: {geoloc_data['lon']}"
+                )
+                if not body:
+                    body = "\n".join(parts)
+
             if not body and not media_urls:
                 return
 
@@ -848,6 +889,31 @@ class XmppAdapter(BasePlatformAdapter):
                     logger.debug("xmpp: MUC real JID from roster: %s → %s", from_resource, real_jid)
                 elif user_id == chat_id:
                     logger.debug("xmpp: MUC anonymous — no real JID for %s in %s", from_resource, from_bare)
+
+                # ── @mention detection ─────────────────────────────────
+                # Check XEP-0372 <reference type='mention'> elements.
+                # slixmpp's xep_0372 registers Reference as a single
+                # sub-element (not iterable), so we use XML directly to
+                # catch multi-reference messages.
+                mentioned: bool = False
+                try:
+                    xml_el = stanza_to_dispatch.xml
+                    if xml_el is not None:
+                        ref_ns = "urn:xmpp:reference:0"
+                        for ref_el in xml_el.findall(f"{{{ref_ns}}}reference"):
+                            if ref_el.get("type") == "mention":
+                                uri = ref_el.get("uri") or ""
+                                if self._self_bare in uri:
+                                    mentioned = True
+                                    break
+                except Exception:
+                    pass
+                if not mentioned and from_resource:
+                    our_nick = self._muc_nick_for_room(from_bare)
+                    if our_nick and body:
+                        mentioned = our_nick in body
+                if mentioned:
+                    logger.debug("xmpp: bot mentioned in MUC %s by %s", from_bare, from_resource)
             else:
                 chat_type = "dm"
                 chat_id = from_bare
@@ -930,6 +996,19 @@ class XmppAdapter(BasePlatformAdapter):
                 media_types=media_types,
             )
             await self.handle_message(event)
+
+            # ── XEP-0333 Chat Marker: acknowledge as displayed ──────
+            if msg_id and from_full and "xep_0333" in self._registered_plugins and self.client is not None:
+                try:
+                    mtype = "groupchat" if stanza_type == "groupchat" else "chat"
+                    self.client["xep_0333"].send_marker(
+                        mto=JID(from_full),
+                        id=msg_id,
+                        marker="displayed",
+                        mtype=mtype,
+                    )
+                except Exception:
+                    logger.debug("xmpp: failed to send chat marker", exc_info=True)
         except Exception:
             logger.exception("xmpp: error handling inbound stanza")
 

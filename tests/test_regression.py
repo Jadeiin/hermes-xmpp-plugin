@@ -54,7 +54,7 @@ class _FakeMessageEvent:
         self.media_types = media_types or []
 
 gw_base.MessageEvent = _FakeMessageEvent
-gw_base.MessageType = type("MessageType", (), {"TEXT": "text", "IMAGE": "image", "COMMAND": "command", "VOICE": "voice"})
+gw_base.MessageType = type("MessageType", (), {"TEXT": "text", "IMAGE": "image", "COMMAND": "command", "VOICE": "voice", "PHOTO": "photo", "VIDEO": "video", "AUDIO": "audio", "DOCUMENT": "document"})
 
 class _FakeProcessingOutcome:
     SUCCESS = 0
@@ -71,6 +71,12 @@ async def _mock_cache_audio_from_url(url: str, ext: str = ".ogg") -> str:
     return f"/tmp/mock_audio{ext}"
 
 gw_base.cache_audio_from_url = _mock_cache_audio_from_url
+
+# Mock cache_image_from_url for tests (no real HTTP)
+async def _mock_cache_image_from_url(url: str, ext: str = ".jpg") -> str:
+    return f"/tmp/mock_image{ext}"
+
+gw_base.cache_image_from_url = _mock_cache_image_from_url
 
 def _mock_truncate(self, content, max_len, **kw):
     """Minimal truncate_message for tests: splits at max_len boundaries."""
