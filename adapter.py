@@ -18,6 +18,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -836,10 +837,14 @@ class XmppAdapter(BasePlatformAdapter):
             except Exception:
                 logger.debug("xmpp: media extraction skipped", exc_info=True)
 
-            # ── Inbound GeoLoc (XEP-0080) ────────────────────────────
-            # Uses slixmpp's Geoloc stanza registered on Message above.
+            # ── Inbound GeoLoc (XEP-0080 + geo: URI fallback) ───────
+            # Two paths:
+            #   1. XEP-0080 <geoloc> element (standard, but few clients use it)
+            #   2. geo: URI in body/OOB (Conversations' actual location format)
             geoloc_data: Optional[Dict[str, str]] = None
+
             if not media_urls:
+                # Path 1: XEP-0080 <geoloc xmlns='http://jabber.org/protocol/geoloc'>
                 try:
                     geoloc = stanza_to_dispatch["geoloc"]
                     if geoloc is not None and geoloc.xml is not None:
@@ -853,6 +858,30 @@ class XmppAdapter(BasePlatformAdapter):
                             }
                 except Exception:
                     pass
+
+                # Path 2: geo: URI (RFC 5870) — used by Conversations
+                if not geoloc_data:
+                    geo_uri = ""
+                    if body and body.strip().startswith("geo:"):
+                        geo_uri = body.strip()
+                    elif "xep_0066" in self._registered_plugins:
+                        try:
+                            oob_url = stanza_to_dispatch["oob"]["url"]
+                            if oob_url and str(oob_url).startswith("geo:"):
+                                geo_uri = str(oob_url)
+                        except Exception:
+                            pass
+                    if geo_uri:
+                        m = re.match(
+                            r"geo:(-?\d+\.?\d*),(-?\d+\.?\d*)",
+                            geo_uri,
+                        )
+                        if m:
+                            geoloc_data = {
+                                "lat": m.group(1),
+                                "lon": m.group(2),
+                                "description": "",
+                            }
 
             if geoloc_data:
                 message_type = MessageType.LOCATION
