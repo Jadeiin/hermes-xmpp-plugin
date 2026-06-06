@@ -27,6 +27,7 @@ from slixmpp.clientxmpp import ClientXMPP
 from slixmpp.jid import JID  # type: ignore[import-untyped]
 from slixmpp.plugins import register_plugin  # type: ignore[import-untyped]
 from slixmpp.stanza import Message  # type: ignore[import-untyped]
+from slixmpp.xmlstream import register_stanza_plugin  # type: ignore[import-untyped]
 
 # ----------------------------------------------------------------
 # slixmpp-omemo imports — guarded but present at runtime on this host
@@ -457,6 +458,24 @@ class XmppAdapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("xmpp: slixmpp plugin %s not available", plugin)
 
+        # ── Stanza registrations for inbound features ──────────────
+        # XEP-0080: register Geoloc on Message so stanza['geoloc'] works
+        try:
+            from slixmpp.plugins.xep_0080.stanza import Geoloc  # type: ignore[import-untyped]
+            register_stanza_plugin(Message, Geoloc)
+            logger.debug("xmpp: registered XEP-0080 Geoloc on Message stanza")
+        except Exception:
+            logger.debug("xmpp: XEP-0080 Geoloc stanza not available")
+
+        # XEP-0372: re-register Reference as iterable for multi-ref messages
+        try:
+            from slixmpp.plugins.xep_0372.stanza import Reference  # type: ignore[import-untyped]
+            Reference.plugin_multi_attrib = 'references'
+            register_stanza_plugin(Message, Reference, iterable=True)
+            logger.debug("xmpp: re-registered XEP-0372 Reference as iterable")
+        except Exception:
+            logger.debug("xmpp: XEP-0372 Reference stanza not available")
+
         # OMEMO plugin registration
         omemo_ok = False
         if self._omemo_enabled and SLIXMPP_OMEMO_AVAILABLE:
@@ -818,31 +837,19 @@ class XmppAdapter(BasePlatformAdapter):
                 logger.debug("xmpp: media extraction skipped", exc_info=True)
 
             # ── Inbound GeoLoc (XEP-0080) ────────────────────────────
-            # Parse <geoloc xmlns='http://jabber.org/protocol/geoloc'> in message
+            # Uses slixmpp's Geoloc stanza registered on Message above.
             geoloc_data: Optional[Dict[str, str]] = None
             if not media_urls:
                 try:
-                    geoloc_el = stanza_to_dispatch.xml.find(
-                        "{http://jabber.org/protocol/geoloc}geoloc"
-                    )
-                    if geoloc_el is not None:
-                        lat = None
-                        lon = None
-                        desc = None
-                        for child in geoloc_el:
-                            tag = child.tag.split("}", 1)[-1] if "}" in child.tag else child.tag
-                            text = (child.text or "").strip()
-                            if tag == "lat":
-                                lat = text
-                            elif tag == "lon":
-                                lon = text
-                            elif tag == "description":
-                                desc = text
+                    geoloc = stanza_to_dispatch["geoloc"]
+                    if geoloc is not None and geoloc.xml is not None:
+                        lat = geoloc["lat"]
+                        lon = geoloc["lon"]
                         if lat and lon:
                             geoloc_data = {
-                                "lat": lat,
-                                "lon": lon,
-                                "description": desc or "",
+                                "lat": str(lat),
+                                "lon": str(lon),
+                                "description": geoloc["description"] or "",
                             }
                 except Exception:
                     pass
@@ -891,21 +898,16 @@ class XmppAdapter(BasePlatformAdapter):
                     logger.debug("xmpp: MUC anonymous — no real JID for %s in %s", from_resource, from_bare)
 
                 # ── @mention detection ─────────────────────────────────
-                # Check XEP-0372 <reference type='mention'> elements.
-                # slixmpp's xep_0372 registers Reference as a single
-                # sub-element (not iterable), so we use XML directly to
-                # catch multi-reference messages.
+                # Uses XEP-0372 Reference re-registered as iterable above:
+                # stanza['references'] → list of Reference with type/uri.
                 mentioned: bool = False
                 try:
-                    xml_el = stanza_to_dispatch.xml
-                    if xml_el is not None:
-                        ref_ns = "urn:xmpp:reference:0"
-                        for ref_el in xml_el.findall(f"{{{ref_ns}}}reference"):
-                            if ref_el.get("type") == "mention":
-                                uri = ref_el.get("uri") or ""
-                                if self._self_bare in uri:
-                                    mentioned = True
-                                    break
+                    for ref in stanza_to_dispatch["references"]:
+                        if ref["type"] == "mention":
+                            uri = ref["uri"] or ""
+                            if self._self_bare in uri:
+                                mentioned = True
+                                break
                 except Exception:
                     pass
                 if not mentioned and from_resource:
