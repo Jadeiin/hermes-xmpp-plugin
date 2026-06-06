@@ -405,8 +405,8 @@ class XmppAdapter(BasePlatformAdapter):
 
         # MUC mention gating — when true, only @mentioned groupchat
         # messages trigger replies.  Aligns with Telegram / Feishu /
-        # WhatsApp / BlueBubbles require_mention.
-        _rm_raw = str(extra.get("require_mention") or os.getenv("XMPP_MUC_REQUIRE_MENTION", ""))
+        # WhatsApp / BlueBubbles require_mention.  Default: true.
+        _rm_raw = str(extra.get("require_mention") or os.getenv("XMPP_REQUIRE_MENTION", "true"))
         self._muc_require_mention: bool = _rm_raw.strip().lower() in ("1", "true", "yes")
 
         # OMEMO
@@ -2080,7 +2080,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         "muc_nick": "XMPP_MUC_NICK",
         "allowed_users": "XMPP_ALLOWED_USERS",
         "allow_all_users": "XMPP_ALLOW_ALL_USERS",
-        "require_mention": "XMPP_MUC_REQUIRE_MENTION",
+        "require_mention": "XMPP_REQUIRE_MENTION",
         "home_channel": "XMPP_HOME_CHANNEL",
     }
     for key, env in env_map.items():
