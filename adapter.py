@@ -745,7 +745,7 @@ class XmppAdapter(BasePlatformAdapter):
         if chat_type == "group":
             return chat_id in self._known_mucs
         if not self.allowed_users:
-            return False
+            return True  # No allowlist → delegate to gateway pairing system
         return self._bare(user_jid) in self.allowed_users
 
     # -----------------------------------------------------------------
