@@ -403,6 +403,12 @@ class XmppAdapter(BasePlatformAdapter):
         allowed_env = str(extra.get("allowed_users") or os.getenv("XMPP_ALLOWED_USERS", "")).strip()
         self.allowed_users = {j.strip() for j in allowed_env.split(",") if j.strip()}
 
+        # MUC mention gating — when true, only @mentioned groupchat
+        # messages trigger replies.  Aligns with Telegram / Feishu /
+        # WhatsApp / BlueBubbles require_mention.
+        _rm_raw = str(extra.get("require_mention") or os.getenv("XMPP_MUC_REQUIRE_MENTION", ""))
+        self._muc_require_mention: bool = _rm_raw.strip().lower() in ("1", "true", "yes")
+
         # OMEMO
         omemo_cfg = extra.get("omemo", {})
         self._omemo_enabled: bool = bool(
@@ -968,6 +974,17 @@ class XmppAdapter(BasePlatformAdapter):
                         mentioned = our_nick in body
                 if mentioned:
                     logger.debug("xmpp: bot mentioned in MUC %s by %s", from_bare, from_resource)
+
+                # ── MUC mention gating ────────────────────────────────
+                # When require_mention is enabled, drop groupchat messages
+                # that don't @mention the bot.  Aligns with Telegram /
+                # Feishu / WhatsApp / BlueBubbles behaviour.
+                if not mentioned and self._muc_require_mention:
+                    logger.debug(
+                        "xmpp: dropping unmentioned MUC message in %s from %s",
+                        from_bare, from_resource,
+                    )
+                    return
             else:
                 chat_type = "dm"
                 chat_id = from_bare
@@ -2036,7 +2053,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     extra = dict(raw.get("extra") or {})
     for key in (
         "jid", "password", "host", "port", "muc_rooms", "muc_nick",
-        "allowed_users", "allow_all_users",
+        "allowed_users", "allow_all_users", "require_mention",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]
@@ -2063,6 +2080,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
         "muc_nick": "XMPP_MUC_NICK",
         "allowed_users": "XMPP_ALLOWED_USERS",
         "allow_all_users": "XMPP_ALLOW_ALL_USERS",
+        "require_mention": "XMPP_MUC_REQUIRE_MENTION",
         "home_channel": "XMPP_HOME_CHANNEL",
     }
     for key, env in env_map.items():
