@@ -433,11 +433,11 @@ class XmppAdapter(BasePlatformAdapter):
         self._pending_reactions: Dict[str, Any] = {}
         self._reactions_enabled: bool = os.getenv("XMPP_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
-        # MAM (XEP-0313) state — replay missed messages after reconnect
+        # MAM (XEP-0313) state — in-memory only (aligns with Telegram's
+        # drop_pending_updates pattern; survives Phase 1 reconnect but
+        # intentionally resets on Phase 2 gateway watcher restart).
         self._mam_enabled: bool = False
         self._mam_replaying: bool = False
-        self._mam_state_dir = Path(__file__).parent / "data"
-        self._mam_state_path = self._mam_state_dir / "mam.json"
         self._mam_last_dm: Optional[datetime] = None
         self._mam_last_rooms: Dict[str, datetime] = {}
 
@@ -486,11 +486,10 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("xmpp: XEP-0372 Reference stanza not available")
 
-        # MAM (XEP-0313) — load persisted state for catch-up after reconnect
+        # MAM (XEP-0313) — in-memory only; no persisted state
         if "xep_0313" in self._registered_plugins:
             self._mam_enabled = True
-            self._mam_load_state()
-            logger.debug("xmpp: MAM (XEP-0313) enabled — will replay missed messages after reconnect")
+            logger.debug("xmpp: MAM (XEP-0313) enabled — will replay missed messages after Phase-1 reconnect")
 
         # OMEMO plugin registration
         omemo_ok = False
@@ -1117,42 +1116,12 @@ class XmppAdapter(BasePlatformAdapter):
         return self._bare(user_jid) in self.allowed_users
 
     # -----------------------------------------------------------------
-    # MAM (XEP-0313) — Message Archive Management
+    # MAM (XEP-0313) — Message Archive Management (in-memory, no disk I/O)
+    #
+    # State is intentionally ephemeral — aligns with Telegram's
+    # drop_pending_updates pattern. Timestamps survive Phase-1 reconnect
+    # (same adapter instance) but reset on Phase-2 gateway watcher restart.
     # -----------------------------------------------------------------
-
-    def _mam_load_state(self) -> None:
-        """Load persisted MAM timestamps from disk."""
-        try:
-            if self._mam_state_path.exists():
-                data = json.loads(self._mam_state_path.read_text())
-                if "last_dm" in data:
-                    self._mam_last_dm = datetime.fromisoformat(data["last_dm"])
-                if "rooms" in data:
-                    for room_jid, ts_str in data["rooms"].items():
-                        self._mam_last_rooms[room_jid] = datetime.fromisoformat(ts_str)
-                logger.debug(
-                    "xmpp: MAM state loaded — DM: %s, rooms: %d",
-                    self._mam_last_dm.isoformat() if self._mam_last_dm else "none",
-                    len(self._mam_last_rooms),
-                )
-        except Exception:
-            logger.debug("xmpp: MAM state load failed", exc_info=True)
-
-    def _mam_save_state(self) -> None:
-        """Persist MAM timestamps to disk."""
-        try:
-            self._mam_state_dir.mkdir(parents=True, exist_ok=True)
-            data: Dict[str, Any] = {}
-            if self._mam_last_dm is not None:
-                data["last_dm"] = self._mam_last_dm.isoformat()
-            if self._mam_last_rooms:
-                data["rooms"] = {
-                    room: ts.isoformat()
-                    for room, ts in self._mam_last_rooms.items()
-                }
-            self._mam_state_path.write_text(json.dumps(data, indent=2))
-        except Exception:
-            logger.debug("xmpp: MAM state save failed", exc_info=True)
 
     def _mam_update_timestamp(self, chat_type: str, chat_id: str) -> None:
         """Update the MAM last-seen timestamp after processing a message."""
@@ -1163,7 +1132,6 @@ class XmppAdapter(BasePlatformAdapter):
             self._mam_last_dm = now
         else:
             self._mam_last_rooms[chat_id] = now
-        self._mam_save_state()
 
     async def _mam_catch_up(self) -> None:
         """Replay missed messages from the server archive after reconnect.
@@ -1247,7 +1215,6 @@ class XmppAdapter(BasePlatformAdapter):
             self._mam_last_dm = cutoff
             for room in self.muc_rooms:
                 self._mam_last_rooms[room.room] = cutoff
-            self._mam_save_state()
 
             if total_replayed:
                 logger.info("xmpp: MAM catch-up complete — %d total messages replayed", total_replayed)
