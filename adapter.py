@@ -447,14 +447,6 @@ class XmppAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event: Dict[str, dict] = {}
         self._approval_prompt_by_session: Dict[str, str] = {}
 
-        # Command prefix detection: messages starting with any of these
-        # are flagged as MessageType.COMMAND.  Configurable via
-        # XMPP_COMMAND_PREFIXES env var (comma-separated, e.g. "/,!,#").
-        raw_prefixes = os.getenv("XMPP_COMMAND_PREFIXES", "/,!")
-        self._command_prefixes: tuple[str, ...] = tuple(
-            p.strip() for p in raw_prefixes.split(",") if p.strip()
-        )
-
         # MAM (XEP-0313) state — in-memory only (aligns with Telegram's
         # drop_pending_updates pattern; survives Phase 1 reconnect but
         # intentionally resets on Phase 2 gateway watcher restart).
@@ -956,10 +948,6 @@ class XmppAdapter(BasePlatformAdapter):
                         body = location_text
                 else:
                     body = body + "\n\n" + location_text
-
-            # ── Command detection ────────────────────────────────────
-            if body and body.strip().startswith(self._command_prefixes):
-                message_type = MessageType.COMMAND
 
             if not body and not media_urls:
                 return
