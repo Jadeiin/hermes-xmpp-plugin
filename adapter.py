@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from slixmpp.clientxmpp import ClientXMPP
 from slixmpp.jid import JID  # type: ignore[import-untyped]
@@ -409,6 +409,14 @@ class XmppAdapter(BasePlatformAdapter):
         _rm_raw = str(extra.get("require_mention") or os.getenv("XMPP_REQUIRE_MENTION", "true"))
         self._muc_require_mention: bool = _rm_raw.strip().lower() in ("1", "true", "yes")
 
+        # XEP-0394 / XEP-0071 rich markup (default: disabled to keep
+        # message size small).  Enable explicitly in config.yaml extra
+        # or via env vars.
+        _mk_raw = str(extra.get("xep_0394_enabled") or os.getenv("XMPP_XEP_0394_ENABLED", "false"))
+        self._xep_0394_enabled: bool = _mk_raw.strip().lower() in ("1", "true", "yes")
+        _html_raw = str(extra.get("xep_0071_enabled") or os.getenv("XMPP_XEP_0071_ENABLED", "false"))
+        self._xep_0071_enabled: bool = _html_raw.strip().lower() in ("1", "true", "yes")
+
         # OMEMO
         omemo_cfg = extra.get("omemo", {})
         self._omemo_enabled: bool = bool(
@@ -478,13 +486,28 @@ class XmppAdapter(BasePlatformAdapter):
 
         # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
         # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
-        for plugin in ("xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359", "xep_0333", "xep_0372", "xep_0313"):
+        for plugin in ("xep_0071", "xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359", "xep_0333", "xep_0372", "xep_0313"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
                 logger.debug("xmpp: registered slixmpp plugin %s", plugin)
             except Exception:
                 logger.warning("xmpp: slixmpp plugin %s not available", plugin)
+
+        # Suppress debug print('coucou', ...) in slixmpp's xep_0394.to_xhtml_im()
+        if "xep_0394" in self._registered_plugins:
+            try:
+                import contextlib, io, functools
+                xep0394 = client["xep_0394"]
+                _orig_to_xhtml = xep0394.to_xhtml_im
+                @functools.wraps(_orig_to_xhtml)
+                def _quiet_to_xhtml_im(body, markup):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        return _orig_to_xhtml(body, markup)
+                xep0394.to_xhtml_im = _quiet_to_xhtml_im  # type: ignore[method-assign]
+                logger.debug("xmpp: suppressed debug print in to_xhtml_im()")
+            except Exception:
+                pass
 
         # ── Stanza registrations for inbound features ──────────────
         # XEP-0080: register Geoloc on Message so stanza['geoloc'] works
@@ -1391,12 +1414,25 @@ class XmppAdapter(BasePlatformAdapter):
                 # Attach XEP-0201 thread id for thread-aware clients
                 if thread_id:
                     stanza["thread"] = thread_id
-                # Attach XEP-0394 markup if available
-                if "xep_0394" in self._registered_plugins and getattr(stanza, "xml", None) is not None:
+                # Attach XEP-0394 markup and XEP-0071 XHTML-IM if enabled.
+                # to_xhtml_im() reads spans from markup['substanzas']; called
+                # first so the Markup object is intact before its XML is moved
+                # into the stanza by xml.append().
+                if (self._xep_0394_enabled or self._xep_0071_enabled) and getattr(stanza, "xml", None) is not None:
                     try:
                         markup = self._build_markup(chunk)
                         if markup is not None:
-                            stanza.xml.append(markup.xml)
+                            # XHTML-IM first (reads from markup['substanzas'])
+                            if self._xep_0071_enabled:
+                                try:
+                                    xhtml = client_local["xep_0394"].to_xhtml_im(chunk, markup)
+                                    if xhtml is not None and getattr(xhtml, "xml", None) is not None:
+                                        stanza.xml.append(xhtml.xml)
+                                except Exception:
+                                    logger.warning("xmpp: failed to attach XHTML-IM", exc_info=True)
+                            # Markup second (no deepcopy needed — to_xhtml_im is done)
+                            if self._xep_0394_enabled:
+                                stanza.xml.append(markup.xml)
                     except Exception:
                         logger.debug("xmpp: failed to attach markup", exc_info=True)
                 stanza.send()
@@ -1438,6 +1474,23 @@ class XmppAdapter(BasePlatformAdapter):
                 mtype=mtype,
                 mbody=content,
             )
+
+            # Attach XHTML-IM (XEP-0071) for rich-text correction display.
+            # Safe: if OMEMO encryption succeeds below, stanza is replaced with
+            # a new encrypted object (XHTML-IM stripped). If encryption fails or
+            # is not applicable, the XHTML-IM stays on the plaintext stanza.
+            if self._xep_0071_enabled or self._xep_0394_enabled:
+                try:
+                    markup = self._build_markup(content)
+                    if markup is not None:
+                        if self._xep_0071_enabled:
+                            xhtml = client_local["xep_0394"].to_xhtml_im(content, markup)
+                            if xhtml is not None and getattr(xhtml, "xml", None) is not None:
+                                stanza.xml.append(xhtml.xml)
+                        if self._xep_0394_enabled:
+                            stanza.xml.append(markup.xml)
+                except Exception:
+                    logger.debug("xmpp: failed to attach XHTML-IM to edit", exc_info=True)
 
             # OMEMO encrypt for 1:1 chats (same path as send())
             if (
@@ -1530,43 +1583,58 @@ class XmppAdapter(BasePlatformAdapter):
         """Return a slixmpp Markup element with basic formatting hints.
 
         Supports Markdown-lite in body:
-        - **bold** or __bold__ → emphasis
+        - **bold** or __bold__ → emphasis (strong)
+        - *italic* or _italic_ → emphasis
+        - ~strikethrough~ → deleted
         - `code` or ``code`` → code span
         - ```code block``` → block-code
         """
         try:
-            from slixmpp.plugins.xep_0394.stanza import Markup, Span, BlockCode, EmphasisType, CodeType
+            from slixmpp.plugins.xep_0394.stanza import Markup, Span, BlockCode
         except ImportError:
             return None
         markup = Markup(parent=None)
-        spans: List[Any] = []
         import re
+
+        # Collect all spans with (start, end, type) to avoid overlaps
+        raw_spans: List[Tuple[int, int, str]] = []
+
+        # Bold: **text** or __text__
         for m in re.finditer(r'\*\*(.+?)\*\*|__(.+?)__', body, re.DOTALL):
-            start = m.start()
-            end = m.end()
-            span = Span(parent=markup)
+            raw_spans.append((m.start(), m.end(), 'emphasis'))
+        # Italic: *text* (single asterisk, not part of **)
+        for m in re.finditer(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', body, re.DOTALL):
+            raw_spans.append((m.start(), m.end(), 'emphasis'))
+        # Italic: _text_ (single underscore, not part of __)
+        for m in re.finditer(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', body, re.DOTALL):
+            raw_spans.append((m.start(), m.end(), 'emphasis'))
+        # Strikethrough: ~~text~~ or ~text~
+        for m in re.finditer(r'~~(.+?)~~', body, re.DOTALL):
+            raw_spans.append((m.start(), m.end(), 'deleted'))
+        for m in re.finditer(r'(?<!~)~(?!~)(.+?)(?<!~)~(?!~)', body, re.DOTALL):
+            raw_spans.append((m.start(), m.end(), 'deleted'))
+        # Inline code: `text` or ``text`` (must not touch ``` fences)
+        for m in re.finditer(r'(?<!`)`{1,2}([^`]+)`{1,2}(?!`)', body, re.DOTALL):
+            raw_spans.append((m.start(), m.end(), 'code'))
+
+        # Build spans via markup.append() so slixmpp's plugin registry
+        # (iterables / substanzas) picks them up.  Raw xml.append() is not
+        # enough — the internal plugin-tracking data structures stay stale.
+        for start, end, type_ in raw_spans:
+            span = Span()
             span["start"] = start
             span["end"] = end
-            span.xml.append(EmphasisType(parent=span).xml)
-            spans.append(span)
-        for m in re.finditer(r'`{1,2}([^`]+)`{1,2}', body, re.DOTALL):
-            start = m.start()
-            end = m.end()
-            span = Span(parent=markup)
-            span["start"] = start
-            span["end"] = end
-            span.xml.append(CodeType(parent=span).xml)
-            spans.append(span)
+            span["types"] = [type_]
+            markup.append(span)
+
+        # Block code: ```code block```
         for m in re.finditer(r'```(.+?)```', body, re.DOTALL):
-            start = m.start()
-            end = m.end()
-            bcode = BlockCode(parent=markup)
-            bcode["start"] = start
-            bcode["end"] = end
-            spans.append(bcode)
-        for s in spans:
-            markup.xml.append(s.xml)
-        return markup if spans else None
+            bcode = BlockCode()
+            bcode["start"] = m.start()
+            bcode["end"] = m.end()
+            markup.append(bcode)
+
+        return markup if raw_spans else None
 
     async def _send_encrypted(self, chat_id: str, content: str, *, thread_id: Optional[str] = None, reply_to: Optional[str] = None) -> SendResult:
         """Send an OMEMO-encrypted 1:1 chat message, split into chunks if needed."""
@@ -1608,6 +1676,19 @@ class XmppAdapter(BasePlatformAdapter):
                         stanza["reply"]["id"] = chunk_reply_to
                     except Exception:
                         logger.debug("xmpp: failed to attach reply to fallback stanza", exc_info=True)
+                # Attach XHTML-IM on fallback (safe — already going plaintext)
+                if self._xep_0071_enabled or self._xep_0394_enabled:
+                    try:
+                        markup = self._build_markup(chunk)
+                        if markup is not None:
+                            if self._xep_0071_enabled:
+                                xhtml = client_local["xep_0394"].to_xhtml_im(chunk, markup)
+                                if xhtml is not None and getattr(xhtml, "xml", None) is not None:
+                                    stanza.xml.append(xhtml.xml)
+                            if self._xep_0394_enabled:
+                                stanza.xml.append(markup.xml)
+                    except Exception:
+                        logger.debug("xmpp: failed to attach XHTML-IM on fallback", exc_info=True)
                 stanza.send()
                 try:
                     last_msg_id = stanza["id"]
@@ -2358,6 +2439,8 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         ("XMPP_MUC_NICK", "muc_nick"),
         ("XMPP_ALLOWED_USERS", "allowed_users"),
         ("XMPP_ALLOW_ALL_USERS", "allow_all_users"),
+        ("XMPP_XEP_0394_ENABLED", "xep_0394_enabled"),
+        ("XMPP_XEP_0071_ENABLED", "xep_0071_enabled"),
     ):
         value = os.getenv(env, "").strip()
         if value:
@@ -2371,6 +2454,7 @@ def _apply_yaml_config(yaml_cfg: dict, xmpp_cfg: dict) -> Optional[dict[str, Any
     for key in (
         "jid", "password", "host", "port", "muc_rooms", "muc_nick",
         "allowed_users", "allow_all_users", "require_mention",
+        "xep_0394_enabled", "xep_0071_enabled",
     ):
         if key in raw and key not in extra:
             extra[key] = raw[key]
