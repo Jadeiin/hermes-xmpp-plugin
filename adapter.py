@@ -486,7 +486,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
         # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
-        for plugin in ("xep_0071", "xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359", "xep_0333", "xep_0372", "xep_0313"):
+        for plugin in ("xep_0071", "xep_0394", "xep_0444", "xep_0004", "xep_0050", "xep_0461", "xep_0446", "xep_0447", "xep_0308", "xep_0424", "xep_0359", "xep_0333", "xep_0372", "xep_0513", "xep_0313"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
@@ -1009,24 +1009,78 @@ class XmppAdapter(BasePlatformAdapter):
                     logger.debug("xmpp: MUC anonymous — no real JID for %s in %s", from_resource, from_bare)
 
                 # ── @mention detection ─────────────────────────────────
-                # Uses XEP-0372 Reference re-registered as iterable above:
-                # stanza['references'] → list of Reference with type/uri.
+                # Three-layer detection, newest standard first:
+                #  Layer 0: XEP-0513 Explicit Mentions (urn:xmpp:mentions:0)
+                #  Layer 1: XEP-0372 References (urn:xmpp:reference:0)
+                #  Layer 2: Nick-in-body substring (traditional fallback)
                 mentioned: bool = False
+                mention_begin: Optional[int] = None
+                mention_end: Optional[int] = None
+                our_nick = self._muc_nick_for_room(from_bare)
+
+                # ── Layer 0: XEP-0513 Explicit Mentions ─────────────────
                 try:
-                    for ref in stanza_to_dispatch["references"]:
-                        if ref["type"] == "mention":
-                            uri = ref["uri"] or ""
-                            if self._self_bare in uri:
+                    for m in stanza_to_dispatch["mentions"]:
+                        # Individual mention via JID
+                        m_jid = m["jid"]
+                        if m_jid is not None:
+                            m_bare = str(m_jid.bare) if hasattr(m_jid, 'bare') else str(m_jid)
+                            if m_bare == self._self_bare:
                                 mentioned = True
+                                mention_begin = m["begin"]
+                                mention_end = m["end"]
+                                logger.debug("xmpp: XEP-0513 mention (jid=%s, begin=%s, end=%s)",
+                                             m_bare, mention_begin, mention_end)
                                 break
+                        # Individual mention via occupant-id (XEP-0421) — not yet implemented
+                        # Group mention via 'mentions' attribute (e.g. #channel, #moderators)
+                        if m["mentions"]:
+                            logger.debug("xmpp: XEP-0513 group mention: %s", m["mentions"])
+                            mentioned = True
+                            break
                 except Exception:
                     pass
+
+                # ── Layer 1: XEP-0372 References ────────────────────────
+                if not mentioned:
+                    try:
+                        for ref in stanza_to_dispatch["references"]:
+                            if ref["type"] == "mention":
+                                uri = ref["uri"] or ""
+                                if self._self_bare in uri:
+                                    mentioned = True
+                                    break
+                    except Exception:
+                        pass
+
+                # ── Layer 2: Nick-in-body fallback ──────────────────────
                 if not mentioned and from_resource:
-                    our_nick = self._muc_nick_for_room(from_bare)
                     if our_nick and body:
                         mentioned = our_nick in body
+
+                # ── Mention prefix stripping ────────────────────────────
                 if mentioned:
                     logger.debug("xmpp: bot mentioned in MUC %s by %s", from_bare, from_resource)
+                    if body:
+                        # Prefer XEP-0513 begin/end (precise substring indices)
+                        if mention_begin is not None and mention_end is not None:
+                            try:
+                                _b = int(mention_begin) if not isinstance(mention_begin, int) else mention_begin
+                                _e = int(mention_end) if not isinstance(mention_end, int) else mention_end
+                                if 0 <= _b < _e <= len(body):
+                                    body = (body[:_b] + body[_e:]).lstrip()
+                                    logger.debug("xmpp: stripped mention via XEP-0513 begin/end [%d:%d] → %r", _b, _e, body)
+                            except (ValueError, TypeError):
+                                pass
+                        # Fallback: nick-based prefix stripping
+                        if body and our_nick:
+                            _lower_body = body.lower()
+                            _lower_nick = our_nick.lower()
+                            if _lower_body.startswith(_lower_nick):
+                                _after = body[len(our_nick):]
+                                if _after.startswith((": ", " ", ":", ",")):
+                                    body = _after.lstrip(": ,").lstrip()
+                                    logger.debug("xmpp: stripped mention prefix via nick → %r", body)
 
                 # ── MUC mention gating ────────────────────────────────
                 # When require_mention is enabled, drop groupchat messages
