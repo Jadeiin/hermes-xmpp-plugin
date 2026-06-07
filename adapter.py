@@ -447,6 +447,10 @@ class XmppAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event: Dict[str, dict] = {}
         self._approval_prompt_by_session: Dict[str, str] = {}
 
+        # Reaction-based clarify (cf. reaction-based exec approval pattern)
+        self._clarify_prompts_by_event: Dict[str, dict] = {}
+        self._clarify_prompt_by_session: Dict[str, str] = {}
+
         # MAM (XEP-0313) state — in-memory only (aligns with Telegram's
         # drop_pending_updates pattern; survives Phase 1 reconnect but
         # intentionally resets on Phase 2 gateway watcher restart).
@@ -1672,7 +1676,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         The XEP-0444 plugin fires this event with a fully parsed Message
         stanza.  We extract the target message ID and reaction value,
-        then check if it resolves a pending exec-approval prompt.
+        then check if it resolves a pending exec-approval or clarify prompt.
         """
         try:
             from_full = str(message["from"])
@@ -1701,61 +1705,111 @@ class XmppAdapter(BasePlatformAdapter):
                     rxn_val, target_id, from_bare,
                 )
 
-                # Check approval map
+                # ── Check approval map ──
                 prompt = self._approval_prompts_by_event.get(target_id)
-                if not prompt or prompt.get("resolved"):
-                    logger.debug(
-                        "xmpp: reaction on %s — no pending approval (prompt=%s)",
-                        target_id, bool(prompt),
-                    )
-                    continue
+                if prompt and not prompt.get("resolved"):
+                    choice = self._approval_reaction_map.get(rxn_val)
+                    if choice:
+                        if self._is_authorized(
+                            chat_type="dm", chat_id=from_bare, user_jid=from_bare
+                        ):
+                            asyncio.ensure_future(
+                                self._resolve_approval_reaction(
+                                    from_bare, target_id, prompt, choice
+                                )
+                            )
+                    continue  # handled — skip clarify check
 
-                choice = self._approval_reaction_map.get(rxn_val)
-                logger.debug(
-                    "xmpp: reaction on approval msg — choice=%s", choice,
-                )
-                if not choice:
-                    continue
-
-                if not self._is_authorized(
-                    chat_type="dm", chat_id=from_bare, user_jid=from_bare
-                ):
-                    logger.debug(
-                        "xmpp: ignoring approval reaction from unauthorized %s",
-                        from_bare,
-                    )
-                    continue
-
-                try:
-                    from tools.approval import resolve_gateway_approval
-
-                    count = resolve_gateway_approval(
-                        prompt["session_key"], choice
-                    )
-                    if count:
-                        prompt["resolved"] = True
-                        self._approval_prompts_by_event.pop(target_id, None)
-                        self._approval_prompt_by_session.pop(
-                            prompt["session_key"], None
-                        )
-                        logger.debug(
-                            "xmpp: reaction resolved %d approval(s) for "
-                            "session %s (choice=%s, user=%s)",
-                            count, prompt["session_key"], choice, from_bare,
-                        )
-                        # Clean up bot's seed reactions
+                # ── Check clarify map ──
+                clarify_prompt = self._clarify_prompts_by_event.get(target_id)
+                if clarify_prompt and not clarify_prompt.get("resolved"):
+                    if self._is_authorized(
+                        chat_type="dm", chat_id=from_bare, user_jid=from_bare
+                    ):
                         asyncio.ensure_future(
-                            self._cleanup_approval_reactions(
-                                prompt["chat_id"], prompt
+                            self._resolve_clarify_reaction(
+                                from_bare, target_id, clarify_prompt, rxn_val
                             )
                         )
-                except Exception as exc:
-                    logger.error(
-                        "xmpp: failed to resolve gateway approval from "
-                        "reaction: %s", exc
-                    )
+                    continue
         except Exception:
             logger.debug("xmpp: _on_reaction error", exc_info=True)
+
+    async def _resolve_approval_reaction(
+        self, from_bare: str, target_id: str, prompt: dict, choice: str
+    ) -> None:
+        """Resolve a pending exec approval from a reaction."""
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(prompt["session_key"], choice)
+            if count:
+                prompt["resolved"] = True
+                self._approval_prompts_by_event.pop(target_id, None)
+                self._approval_prompt_by_session.pop(prompt["session_key"], None)
+                logger.debug(
+                    "xmpp: reaction resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                    count, prompt["session_key"], choice, from_bare,
+                )
+                await self._cleanup_approval_reactions(prompt["chat_id"], prompt)
+        except Exception as exc:
+            logger.error(
+                "xmpp: failed to resolve gateway approval from reaction: %s", exc
+            )
+
+    async def _resolve_clarify_reaction(
+        self, from_bare: str, target_id: str, prompt: dict, rxn_val: str
+    ) -> None:
+        """Resolve a pending clarify prompt from a reaction."""
+        choice_map = prompt.get("choice_map", {})
+        if rxn_val not in choice_map:
+            logger.debug(
+                "xmpp: clarify reaction %s not in choice_map for %s",
+                rxn_val, target_id,
+            )
+            return
+
+        idx = choice_map[rxn_val]
+        try:
+            from tools.clarify_gateway import (
+                resolve_gateway_clarify,
+                mark_awaiting_text,
+            )
+
+            if idx == -1:  # ✏️ Other → text-capture mode
+                mark_awaiting_text(prompt["clarify_id"])
+                logger.debug(
+                    "xmpp: clarify 'Other' selected — awaiting text from %s",
+                    from_bare,
+                )
+                # Still mark resolved so further reactions are no-ops
+                prompt["resolved"] = True
+                self._clarify_prompts_by_event.pop(target_id, None)
+                self._clarify_prompt_by_session.pop(prompt["session_key"], None)
+                await self._cleanup_clarify_reactions(prompt["chat_id"], prompt)
+                return
+
+            # Numeric choice → resolve immediately
+            choices = prompt.get("choices", [])
+            resolved_text = choices[idx] if 0 <= idx < len(choices) else f"choice {idx + 1}"
+            ok = resolve_gateway_clarify(prompt["clarify_id"], resolved_text)
+            if ok:
+                prompt["resolved"] = True
+                self._clarify_prompts_by_event.pop(target_id, None)
+                self._clarify_prompt_by_session.pop(prompt["session_key"], None)
+                logger.debug(
+                    "xmpp: clarify reaction resolved (id=%s, choice=%r, user=%s)",
+                    prompt["clarify_id"], resolved_text, from_bare,
+                )
+                await self._cleanup_clarify_reactions(prompt["chat_id"], prompt)
+            else:
+                logger.warning(
+                    "xmpp: resolve_gateway_clarify returned False (id=%s)",
+                    prompt["clarify_id"],
+                )
+        except Exception as exc:
+            logger.error(
+                "xmpp: failed to resolve clarify from reaction: %s", exc
+            )
 
     # ── Reaction-based exec approval ──────────────────────────
     async def send_exec_approval(
@@ -1994,60 +2048,118 @@ class XmppAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        """Reaction-based clarify for XMPP (XEP-0444).
+
+        Multi-choice: sends question text with numbered options, then
+        adds numbered emoji reactions (1️⃣–4️⃣ + ✏️ Other).  The user
+        taps a reaction; _on_reaction resolves via resolve_gateway_clarify.
+
+        Open-ended (no choices): falls through to text intercept via
+        self.send() → mark_awaiting_text.
+        """
         if self.client is None:
             return SendResult(success=False, error="xmpp not connected", retryable=True)
 
-        if not choices or "xep_0004" not in self._registered_plugins:
-            # Fallback to text-based clarify
+        # Build the clarify text for body
+        if choices:
+            lines = [f"❓ {question}", ""]
+            for i, choice in enumerate(choices, start=1):
+                lines.append(f"  {i}. {choice}")
+            lines.append("")
+            lines.append("Tap a reaction to select, or react ✏️ to type your own answer.")
+            text = "\n".join(lines)
+        else:
+            text = f"❓ {question}"
+
+        # Always route through self.send() — handles OMEMO encryption
+        result = await self.send(chat_id=chat_id, content=text, metadata=metadata)
+        if not result.success or not result.message_id:
+            # Couldn't deliver prompt — clean up
+            from tools.clarify_gateway import clear_session as _clear
+            _clear(session_key or "")
+            return result
+
+        # Open-ended (no choices) → text-intercept mode
+        if not choices:
             from tools.clarify_gateway import mark_awaiting_text
-            if choices:
-                lines = [f"❓ {question}", ""]
-                for i, choice in enumerate(choices, start=1):
-                    lines.append(f"  {i}. {choice}")
-                lines.append("")
-                lines.append("Reply with the number, the option text, or your own answer.")
-                text = "\n".join(lines)
-                mark_awaiting_text(clarify_id)
-            else:
-                text = f"❓ {question}"
-            return await self.send(chat_id=chat_id, content=text, metadata=metadata)
+            mark_awaiting_text(clarify_id)
+            return result
 
-        mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+        # Multi-choice → add numbered emoji reactions
+        if "xep_0444" not in self._registered_plugins:
+            # Reactions unavailable → fall back to text-intercept
+            from tools.clarify_gateway import mark_awaiting_text
+            mark_awaiting_text(clarify_id)
+            return result
+
+        # Build reaction map: emoji → choice index
+        # Use digit emoji keycaps: 1️⃣ through 4️⃣, then ✏️ for Other
+        _NUM_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣"]
+        reaction_emojis = []
+        choice_map: Dict[str, int] = {}  # emoji → choice index
+        for i in range(min(len(choices), len(_NUM_EMOJIS))):
+            emoji = _NUM_EMOJIS[i]
+            reaction_emojis.append(emoji)
+            choice_map[emoji] = i
+        # ✏️ for "Other (type your own answer)"
+        reaction_emojis.append("✏️")
+        choice_map["✏️"] = -1  # sentinel for Other
+
+        # Store prompt for reaction intercept
+        prompt = {
+            "clarify_id": clarify_id,
+            "session_key": session_key,
+            "chat_id": chat_id,
+            "message_id": result.message_id,
+            "choices": list(choices),
+            "choice_map": choice_map,
+            "resolved": False,
+        }
+        old_event = self._clarify_prompt_by_session.get(session_key)
+        if old_event:
+            self._clarify_prompts_by_event.pop(old_event, None)
+        self._clarify_prompts_by_event[result.message_id] = prompt
+        self._clarify_prompt_by_session[session_key] = result.message_id
+
+        # Send ALL reactions in ONE message — set_reactions REPLACES
         try:
-            form = self.client["xep_0004"].make_form(
-                ftype="form", title=question, instructions="Select an option and submit."
+            mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+            msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
+            self.client["xep_0444"].set_reactions(
+                msg, result.message_id, reaction_emojis
             )
-            form.add_field(
-                var="clarify_id",
-                ftype="hidden",
-                value=clarify_id,
-            )
-            options = [
-                {"label": str(c), "value": str(c)}
-                for c in (choices or [])
-            ]
-            options.append({"label": "Other (type your own answer)", "value": "__other__"})
-            form.add_field(
-                var="answer",
-                ftype="list-single",
-                label=question,
-                options=options,
-            )
-
-            msg = self.client.make_message(mto=chat_id, mtype=mtype)
-            msg["body"] = question
-            msg["form"] = form
+            msg.enable("store")
             msg.send()
-
-            msg_id = None
-            try:
-                msg_id = msg["id"]
-            except Exception:
-                pass
-            return SendResult(success=True, message_id=msg_id, raw_response=msg)
         except Exception as exc:
-            logger.exception("xmpp: send_clarify with data form failed")
-            return SendResult(success=False, error=str(exc), retryable=True)
+            logger.warning("xmpp: failed to add clarify reactions: %s", exc)
+            # Fall back to text-intercept
+            from tools.clarify_gateway import mark_awaiting_text
+            mark_awaiting_text(clarify_id)
+
+        return result
+
+    async def _cleanup_clarify_reactions(
+        self, chat_id: str, prompt: dict
+    ) -> None:
+        """Remove bot's seed reactions after clarify is resolved."""
+        if not self.client or "xep_0444" not in self._registered_plugins:
+            return
+        try:
+            mtype = "groupchat" if self._is_muc(chat_id) else "chat"
+            msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
+            self.client["xep_0444"].set_reactions(
+                msg, prompt["message_id"], []
+            )
+            msg.enable("store")
+            msg.send()
+            logger.debug(
+                "xmpp: cleared bot clarify reactions on %s",
+                prompt["message_id"],
+            )
+        except Exception as exc:
+            logger.debug(
+                "xmpp: failed to clear bot clarify reactions: %s", exc
+            )
 
     # -----------------------------------------------------------------
     # Ad-Hoc Commands (XEP-0050)

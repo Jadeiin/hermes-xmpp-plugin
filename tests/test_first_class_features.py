@@ -279,17 +279,21 @@ async def test_on_processing_complete_error(fake_adapter, fake_client):
 
 
 # ------------------------------------------------------------------
-# B2 — Clarify via Data Forms (XEP-0004)
+# B2 — Clarify via Reactions (XEP-0444)
 # ------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_send_clarify_uses_data_form_when_available(fake_adapter, fake_client):
-    xep0004 = MagicMock()
-    fake_form = MagicMock()
-    xep0004.make_form.return_value = fake_form
-    fake_client.plugins["xep_0004"] = xep0004
+async def test_send_clarify_uses_reactions_when_available(fake_adapter, fake_client):
+    """Multi-choice clarify sends text + numbered emoji reactions."""
+    xep0444 = MagicMock()
+    fake_client.plugins["xep_0444"] = xep0444
 
-    choices = [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}]
+    # Mock send() to return success with message_id
+    fake_adapter.send = AsyncMock(return_value=gw_base.SendResult(
+        success=True, message_id="msg-abc"
+    ))
+
+    choices = ["Option A", "Option B", "Option C"]
     result = await fake_adapter.send_clarify(
         chat_id="user@example.org",
         question="Pick one",
@@ -298,24 +302,60 @@ async def test_send_clarify_uses_data_form_when_available(fake_adapter, fake_cli
         session_key="sess-1",
     )
     assert result.success is True
-    xep0004.make_form.assert_called_once()
+    # Verify the adapter sent through self.send() (handles OMEMO)
+    fake_adapter.send.assert_called_once()
+    # Verify reactions were set with numbered emojis + ✏️
+    xep0444.set_reactions.assert_called_once()
+    call_args = xep0444.set_reactions.call_args
+    emojis = call_args[0][2]  # third positional arg
+    assert "1️⃣" in emojis
+    assert "2️⃣" in emojis
+    assert "3️⃣" in emojis
+    assert "✏️" in emojis
+
+    # Verify prompt stored for reaction intercept
+    assert "msg-abc" in fake_adapter._clarify_prompts_by_event
+
+
+@pytest.mark.asyncio
+async def test_send_clarify_open_ended(fake_adapter, fake_client):
+    """Open-ended clarify (no choices) uses text-intercept mode."""
+    fake_adapter.send = AsyncMock(return_value=gw_base.SendResult(
+        success=True, message_id="msg-open"
+    ))
+
+    result = await fake_adapter.send_clarify(
+        chat_id="user@example.org",
+        question="What do you think?",
+        choices=None,
+        clarify_id="clarify-open",
+        session_key="sess-open",
+    )
+    assert result.success is True
+    fake_adapter.send.assert_called_once()
+    # No reactions should be set — open-ended uses text-intercept
+    # No prompt stored for open-ended
 
 
 @pytest.mark.asyncio
 async def test_send_clarify_falls_back_to_text(fake_adapter, fake_client):
-    fake_adapter._registered_plugins.discard("xep_0004")
-    fake_adapter.client = fake_client
+    """When reactions unavailable (no xep_0444), falls back to text-intercept."""
+    fake_adapter._registered_plugins.discard("xep_0444")
+    fake_adapter.send = AsyncMock(return_value=gw_base.SendResult(
+        success=True, message_id="msg-txt"
+    ))
 
-    choices = [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}]
+    choices = ["Option A", "Option B"]
     result = await fake_adapter.send_clarify(
         chat_id="user@example.org",
         question="Pick one",
         choices=choices,
-        clarify_id="clarify-1",
-        session_key="sess-1",
+        clarify_id="clarify-txt",
+        session_key="sess-txt",
     )
-    fake_client.make_message.assert_called_once()
     assert result.success is True
+    fake_adapter.send.assert_called_once()
+    # No reactions — xep_0444 not registered
 
 
 # ------------------------------------------------------------------
