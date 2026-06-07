@@ -76,6 +76,8 @@ async def _mock_cache(url: str, ext: str = ".ogg") -> str:
     return f"/tmp/mock{ext}"
 gw_base.cache_audio_from_url = _mock_cache
 gw_base.cache_image_from_url = _mock_cache
+gw_base.cache_image_from_bytes = lambda data, ext=".jpg": f"/tmp/mock_decrypted{ext}"
+gw_base.cache_audio_from_bytes = lambda data, ext=".ogg": f"/tmp/mock_decrypted{ext}"
 
 def _mock_truncate(self, content, max_len, **kw):
     if max_len <= 0 or len(content) <= max_len:
@@ -639,4 +641,259 @@ class TestOmemoMediaSharing:
             assert "aesgcm://" in send_called[0][1]
         finally:
             os.unlink(tmp_path)
-            ad_module.SLIXMPP_OMEMO_AVAILABLE = orig
+
+
+# ==========================================================================
+# 12. Inbound aesgcm:// (XEP-0454) decryption
+# ==========================================================================
+
+class TestInboundAesgcmDecryption:
+    """Inbound OMEMO-encrypted media (aesgcm:// URLs) must be decrypted."""
+
+    _AESGCM_URL = "aesgcm://upload.example.org/photo.jpg#" + "ab" * 44  # 88 hex chars
+
+    @pytest.mark.asyncio
+    async def test_aesgcm_url_in_body_decrypted(self, adapter_inst):
+        """aesgcm:// URL in body → download + decrypt + add to media_urls."""
+        adapter_inst._registered_plugins = set()
+        adapter_inst._self_bare = "hermes@example.org"
+        adapter_inst.allow_all_users = True
+        adapter_inst.client = None  # no OMEMO → body stays as-is
+
+        stanza = _make_stanza(
+            type="chat",
+            body=f"Look at this: {self._AESGCM_URL}",
+            from_jid="user@example.org",
+        )
+
+        async def fake_decrypt(url):
+            return "/tmp/decrypted_photo.jpg", "image/jpeg"
+
+        orig = adapter._download_and_decrypt_aesgcm
+        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        try:
+            captured_events = []
+            adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
+            await adapter_inst._on_message(stanza)
+        finally:
+            adapter._download_and_decrypt_aesgcm = orig
+
+        assert len(captured_events) == 1
+        event = captured_events[0]
+        assert "aesgcm://" not in event.text
+        assert "Look at this:" in event.text
+        assert "/tmp/decrypted_photo.jpg" in event.media_urls
+        assert "image/jpeg" in event.media_types
+
+    @pytest.mark.asyncio
+    async def test_aesgcm_url_body_only_no_prefix(self, adapter_inst):
+        """Body is just the aesgcm:// URL → body becomes empty after stripping."""
+        adapter_inst._registered_plugins = set()
+        adapter_inst._self_bare = "hermes@example.org"
+        adapter_inst.allow_all_users = True
+        adapter_inst.client = None
+
+        stanza = _make_stanza(
+            type="chat",
+            body=self._AESGCM_URL,
+            from_jid="user@example.org",
+        )
+
+        async def fake_decrypt(url):
+            return "/tmp/decrypted_photo.jpg", "image/jpeg"
+
+        orig = adapter._download_and_decrypt_aesgcm
+        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        try:
+            captured_events = []
+            adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
+            await adapter_inst._on_message(stanza)
+        finally:
+            adapter._download_and_decrypt_aesgcm = orig
+
+        assert len(captured_events) == 1
+        event = captured_events[0]
+        assert not (event.text or "").strip()
+        assert "/tmp/decrypted_photo.jpg" in event.media_urls
+
+    @pytest.mark.asyncio
+    async def test_aesgcm_decrypt_failure_graceful(self, adapter_inst):
+        """If decryption fails, message is still delivered (with aesgcm:// in body)."""
+        adapter_inst._registered_plugins = set()
+        adapter_inst._self_bare = "hermes@example.org"
+        adapter_inst.allow_all_users = True
+        adapter_inst.client = None
+
+        stanza = _make_stanza(
+            type="chat",
+            body=self._AESGCM_URL,
+            from_jid="user@example.org",
+        )
+
+        async def fake_decrypt_fail(url):
+            return None, None
+
+        orig = adapter._download_and_decrypt_aesgcm
+        adapter._download_and_decrypt_aesgcm = fake_decrypt_fail
+        try:
+            captured_events = []
+            adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
+            await adapter_inst._on_message(stanza)
+        finally:
+            adapter._download_and_decrypt_aesgcm = orig
+
+        assert len(captured_events) >= 1
+        event = captured_events[0]
+        assert "aesgcm://" in event.text
+        assert event.media_urls == []
+
+    @pytest.mark.asyncio
+    async def test_aesgcm_url_in_oob_decrypted(self, adapter_inst):
+        """aesgcm:// URL in OOB (XEP-0066) → download + decrypt."""
+        adapter_inst._registered_plugins = {"xep_0066"}
+        adapter_inst._self_bare = "hermes@example.org"
+        adapter_inst.allow_all_users = True
+        adapter_inst.client = None
+
+        class _OOBStanza:
+            def __getitem__(self, k):
+                if k == "type":
+                    return "chat"
+                if k == "body":
+                    return ""
+                if k == "oob":
+                    return {"url": self.__class__._oob_url}
+                return None
+            def get(self, k, default=None):
+                try:
+                    v = self[k]
+                    return v if v is not None else default
+                except Exception:
+                    return default
+            def get_from(self):
+                return "user@example.org"
+        _OOBStanza._oob_url = self._AESGCM_URL
+        stanza = _OOBStanza()
+
+        async def fake_decrypt(url):
+            return "/tmp/decrypted_oob.jpg", "image/jpeg"
+
+        orig = adapter._download_and_decrypt_aesgcm
+        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        try:
+            captured_events = []
+            adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
+            await adapter_inst._on_message(stanza)
+        finally:
+            adapter._download_and_decrypt_aesgcm = orig
+
+        assert len(captured_events) == 1
+        event = captured_events[0]
+        assert "/tmp/decrypted_oob.jpg" in event.media_urls
+        assert "image/jpeg" in event.media_types
+
+    @pytest.mark.asyncio
+    async def test_aesgcm_no_url_no_op(self, adapter_inst):
+        """No aesgcm:// URL → normal flow, no decryption attempted."""
+        adapter_inst._registered_plugins = set()
+        adapter_inst._self_bare = "hermes@example.org"
+        adapter_inst.allow_all_users = True
+        adapter_inst.client = None
+
+        stanza = _make_stanza(
+            type="chat",
+            body="Just a normal message",
+            from_jid="user@example.org",
+        )
+
+        decrypt_calls = []
+        async def fake_decrypt(url):
+            decrypt_calls.append(url)
+            return "/tmp/x.jpg", "image/jpeg"
+
+        orig = adapter._download_and_decrypt_aesgcm
+        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        try:
+            captured_events = []
+            adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
+            await adapter_inst._on_message(stanza)
+        finally:
+            adapter._download_and_decrypt_aesgcm = orig
+
+        assert len(decrypt_calls) == 0
+        assert len(captured_events) == 1
+        assert captured_events[0].text == "Just a normal message"
+
+    @pytest.mark.asyncio
+    async def test_invalid_aesgcm_url_not_matched(self, adapter_inst):
+        """URLs that look like aesgcm:// but have wrong fragment length are ignored."""
+        adapter_inst._registered_plugins = set()
+        adapter_inst._self_bare = "hermes@example.org"
+        adapter_inst.allow_all_users = True
+        adapter_inst.client = None
+
+        bad_url = "aesgcm://example.org/file.jpg#" + "ab" * 43 + "a"
+        stanza = _make_stanza(
+            type="chat",
+            body=bad_url,
+            from_jid="user@example.org",
+        )
+
+        decrypt_calls = []
+        async def fake_decrypt(url):
+            decrypt_calls.append(url)
+            return "/tmp/x.jpg", "image/jpeg"
+
+        orig = adapter._download_and_decrypt_aesgcm
+        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        try:
+            captured_events = []
+            adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
+            await adapter_inst._on_message(stanza)
+        finally:
+            adapter._download_and_decrypt_aesgcm = orig
+
+        assert len(decrypt_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_multiple_aesgcm_urls_in_body(self, adapter_inst):
+        """Multiple aesgcm:// URLs in one message — all are decrypted."""
+        adapter_inst._registered_plugins = set()
+        adapter_inst._self_bare = "hermes@example.org"
+        adapter_inst.allow_all_users = True
+        adapter_inst.client = None
+
+        url1 = "aesgcm://example.org/a.jpg#" + "cd" * 44
+        url2 = "aesgcm://example.org/b.png#" + "ef" * 44
+        body = f"Two images: {url1} and {url2}"
+
+        stanza = _make_stanza(
+            type="chat",
+            body=body,
+            from_jid="user@example.org",
+        )
+
+        decrypt_calls = []
+        async def fake_decrypt(url):
+            decrypt_calls.append(url)
+            if url == url1:
+                return "/tmp/a.jpg", "image/jpeg"
+            return "/tmp/b.png", "image/png"
+
+        orig = adapter._download_and_decrypt_aesgcm
+        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        try:
+            captured_events = []
+            adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
+            await adapter_inst._on_message(stanza)
+        finally:
+            adapter._download_and_decrypt_aesgcm = orig
+
+        assert len(decrypt_calls) == 2
+        assert len(captured_events) == 1
+        event = captured_events[0]
+        assert "aesgcm://" not in event.text
+        assert "Two images:" in event.text
+        assert "and" in event.text
+        assert "/tmp/a.jpg" in event.media_urls
+        assert "/tmp/b.png" in event.media_urls

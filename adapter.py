@@ -22,6 +22,7 @@ import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
@@ -179,6 +180,90 @@ def _guess_mime_from_url(url: str) -> str:
         if path.endswith(ext):
             return mime
     return "application/octet-stream"
+
+
+# aesgcm:// URL pattern — XEP-0454 OMEMO Media Sharing inbound.
+# Format: aesgcm://<host>/<path>#<IV(24 hex)><key(64 hex)>
+_AESGCM_URL_RE = re.compile(r"aesgcm://([^\s#]+)#([0-9a-fA-F]{88})")
+
+
+async def _download_and_decrypt_aesgcm(aesgcm_url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Download an encrypted file (XEP-0454), decrypt it, cache the plaintext.
+
+    Returns (cached_path, mime_type) or (None, None) on failure.
+    """
+    import httpx
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from gateway.platforms.base import cache_image_from_bytes, cache_audio_from_bytes
+
+    match = _AESGCM_URL_RE.match(aesgcm_url)
+    if not match:
+        logger.warning("xmpp: invalid aesgcm:// URL: %s", aesgcm_url)
+        return None, None
+
+    https_path = match.group(1)        # e.g. "upload.example.org/file.jpg"
+    fragment = match.group(2)          # 88 hex chars: IV(24) + key(64)
+
+    if len(fragment) != 88:
+        logger.warning("xmpp: aesgcm:// fragment wrong length (%d)", len(fragment))
+        return None, None
+
+    iv = bytes.fromhex(fragment[:24])
+    key = bytes.fromhex(fragment[24:])
+
+    # Determine MIME type from URL path
+    https_url = "https://" + https_path
+    mime = _guess_mime_from_url(https_url)
+    ext = _mime_to_ext(mime)
+
+    # Download encrypted file
+    try:
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(
+                https_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                    "Accept": "*/*",
+                },
+            )
+            response.raise_for_status()
+            encrypted_data = response.content
+    except Exception as exc:
+        logger.warning("xmpp: failed to download aesgcm:// file %s: %s", https_url, exc)
+        return None, None
+
+    # Decrypt: last 16 bytes are the GCM authentication tag
+    if len(encrypted_data) < 16:
+        logger.warning("xmpp: aesgcm:// file too short (%d bytes)", len(encrypted_data))
+        return None, None
+
+    tag = encrypted_data[-16:]
+    ciphertext = encrypted_data[:-16]
+
+    try:
+        aes_gcm = Cipher(
+            algorithms.AES(key),
+            modes.GCM(iv, tag),
+        ).decryptor()
+        plaintext = aes_gcm.update(ciphertext) + aes_gcm.finalize()
+    except Exception as exc:
+        logger.warning("xmpp: aesgcm:// decryption failed: %s", exc)
+        return None, None
+
+    # Cache decrypted bytes
+    try:
+        if mime.startswith("image/"):
+            cached = cache_image_from_bytes(plaintext, ext)
+        elif mime.startswith("audio/"):
+            cached = cache_audio_from_bytes(plaintext, ext)
+        else:
+            # For documents, use image cache (path doesn't matter for gateway)
+            cached = cache_image_from_bytes(plaintext, ext)
+        logger.debug("xmpp: decrypted aesgcm:// media (%s, %d bytes) → %s", mime, len(plaintext), cached)
+        return cached, mime
+    except Exception as exc:
+        logger.warning("xmpp: aesgcm:// cache failed: %s", exc)
+        return None, None
 
 
 # ----------------------------------------------------------------
@@ -842,11 +927,47 @@ class XmppAdapter(BasePlatformAdapter):
                         logger.warning("OMEMO: failed to decrypt message from %s: %s", from_bare, exc)
                         return
 
+            # ── Inbound aesgcm:// (XEP-0454 OMEMO Media Sharing) ──────
+            # After OMEMO decryption the body may contain aesgcm:// URLs
+            # pointing to encrypted files.  Download + decrypt + cache
+            # before the normal SFS/OOB path (which can't handle aesgcm://).
+            aesgcm_urls: List[str] = []
+            aesgcm_media_urls: List[str] = []
+            aesgcm_media_types: List[str] = []
+            try:
+                # Collect aesgcm:// URLs from body
+                if body:
+                    for m in _AESGCM_URL_RE.finditer(body):
+                        aesgcm_urls.append(m.group(0))
+                # Also check OOB (XEP-0066) for aesgcm://
+                if not aesgcm_urls and "xep_0066" in self._registered_plugins:
+                    try:
+                        oob_url = stanza_to_dispatch["oob"]["url"]
+                        if oob_url and str(oob_url).startswith("aesgcm://"):
+                            aesgcm_urls.append(str(oob_url))
+                    except Exception:
+                        pass
+
+                for aesgcm_url in aesgcm_urls:
+                    cached, mime = await _download_and_decrypt_aesgcm(aesgcm_url)
+                    if cached is not None and mime is not None:
+                        aesgcm_media_urls.append(cached)
+                        aesgcm_media_types.append(mime)
+                        # Strip this aesgcm:// URL from body
+                        body = body.replace(aesgcm_url, "").strip()
+            except Exception:
+                logger.debug("xmpp: aesgcm:// extraction skipped", exc_info=True)
+
             # ── Inbound Voice / Media Extraction ──────────────────────
             # XEP-0447 SFS (Stateless File Sharing) or XEP-0066 OOB
             media_urls: List[str] = []
             media_types: List[str] = []
             message_type = MessageType.TEXT
+
+            # Prepend aesgcm-decrypted media (processed above)
+            if aesgcm_media_urls:
+                media_urls.extend(aesgcm_media_urls)
+                media_types.extend(aesgcm_media_types)
 
             try:
                 # SFS (XEP-0447) — primary path for modern clients
