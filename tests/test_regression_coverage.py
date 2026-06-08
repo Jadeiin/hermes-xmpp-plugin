@@ -669,14 +669,14 @@ class TestInboundAesgcmDecryption:
         async def fake_decrypt(url):
             return "/tmp/decrypted_photo.jpg", "image/jpeg"
 
-        orig = adapter._download_and_decrypt_aesgcm
-        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        orig = adapter_inst._decrypt_aesgcm
+        adapter_inst._decrypt_aesgcm = fake_decrypt
         try:
             captured_events = []
             adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
             await adapter_inst._on_message(stanza)
         finally:
-            adapter._download_and_decrypt_aesgcm = orig
+            adapter_inst._decrypt_aesgcm = orig
 
         assert len(captured_events) == 1
         event = captured_events[0]
@@ -702,14 +702,14 @@ class TestInboundAesgcmDecryption:
         async def fake_decrypt(url):
             return "/tmp/decrypted_photo.jpg", "image/jpeg"
 
-        orig = adapter._download_and_decrypt_aesgcm
-        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        orig = adapter_inst._decrypt_aesgcm
+        adapter_inst._decrypt_aesgcm = fake_decrypt
         try:
             captured_events = []
             adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
             await adapter_inst._on_message(stanza)
         finally:
-            adapter._download_and_decrypt_aesgcm = orig
+            adapter_inst._decrypt_aesgcm = orig
 
         assert len(captured_events) == 1
         event = captured_events[0]
@@ -733,14 +733,14 @@ class TestInboundAesgcmDecryption:
         async def fake_decrypt_fail(url):
             return None, None
 
-        orig = adapter._download_and_decrypt_aesgcm
-        adapter._download_and_decrypt_aesgcm = fake_decrypt_fail
+        orig = adapter_inst._decrypt_aesgcm
+        adapter_inst._decrypt_aesgcm = fake_decrypt_fail
         try:
             captured_events = []
             adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
             await adapter_inst._on_message(stanza)
         finally:
-            adapter._download_and_decrypt_aesgcm = orig
+            adapter_inst._decrypt_aesgcm = orig
 
         assert len(captured_events) >= 1
         event = captured_events[0]
@@ -778,14 +778,14 @@ class TestInboundAesgcmDecryption:
         async def fake_decrypt(url):
             return "/tmp/decrypted_oob.jpg", "image/jpeg"
 
-        orig = adapter._download_and_decrypt_aesgcm
-        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        orig = adapter_inst._decrypt_aesgcm
+        adapter_inst._decrypt_aesgcm = fake_decrypt
         try:
             captured_events = []
             adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
             await adapter_inst._on_message(stanza)
         finally:
-            adapter._download_and_decrypt_aesgcm = orig
+            adapter_inst._decrypt_aesgcm = orig
 
         assert len(captured_events) == 1
         event = captured_events[0]
@@ -811,14 +811,14 @@ class TestInboundAesgcmDecryption:
             decrypt_calls.append(url)
             return "/tmp/x.jpg", "image/jpeg"
 
-        orig = adapter._download_and_decrypt_aesgcm
-        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        orig = adapter_inst._decrypt_aesgcm
+        adapter_inst._decrypt_aesgcm = fake_decrypt
         try:
             captured_events = []
             adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
             await adapter_inst._on_message(stanza)
         finally:
-            adapter._download_and_decrypt_aesgcm = orig
+            adapter_inst._decrypt_aesgcm = orig
 
         assert len(decrypt_calls) == 0
         assert len(captured_events) == 1
@@ -844,14 +844,14 @@ class TestInboundAesgcmDecryption:
             decrypt_calls.append(url)
             return "/tmp/x.jpg", "image/jpeg"
 
-        orig = adapter._download_and_decrypt_aesgcm
-        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        orig = adapter_inst._decrypt_aesgcm
+        adapter_inst._decrypt_aesgcm = fake_decrypt
         try:
             captured_events = []
             adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
             await adapter_inst._on_message(stanza)
         finally:
-            adapter._download_and_decrypt_aesgcm = orig
+            adapter_inst._decrypt_aesgcm = orig
 
         assert len(decrypt_calls) == 0
 
@@ -880,14 +880,14 @@ class TestInboundAesgcmDecryption:
                 return "/tmp/a.jpg", "image/jpeg"
             return "/tmp/b.png", "image/png"
 
-        orig = adapter._download_and_decrypt_aesgcm
-        adapter._download_and_decrypt_aesgcm = fake_decrypt
+        orig = adapter_inst._decrypt_aesgcm
+        adapter_inst._decrypt_aesgcm = fake_decrypt
         try:
             captured_events = []
             adapter_inst.handle_message = lambda e: captured_events.append(e) or asyncio.sleep(0)
             await adapter_inst._on_message(stanza)
         finally:
-            adapter._download_and_decrypt_aesgcm = orig
+            adapter_inst._decrypt_aesgcm = orig
 
         assert len(decrypt_calls) == 2
         assert len(captured_events) == 1

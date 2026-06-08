@@ -26,6 +26,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
+import httpx
 from slixmpp.clientxmpp import ClientXMPP
 from slixmpp.jid import JID  # type: ignore[import-untyped]
 from slixmpp.plugins import register_plugin  # type: ignore[import-untyped]
@@ -60,7 +61,9 @@ from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
     MessageType,
     ProcessingOutcome,
     SendResult,
+    cache_audio_from_bytes,
     cache_audio_from_url,
+    cache_image_from_bytes,
     cache_image_from_url,
 )
 
@@ -185,85 +188,6 @@ def _guess_mime_from_url(url: str) -> str:
 # aesgcm:// URL pattern — XEP-0454 OMEMO Media Sharing inbound.
 # Format: aesgcm://<host>/<path>#<IV(24 hex)><key(64 hex)>
 _AESGCM_URL_RE = re.compile(r"aesgcm://([^\s#]+)#([0-9a-fA-F]{88})")
-
-
-async def _download_and_decrypt_aesgcm(aesgcm_url: str) -> Tuple[Optional[str], Optional[str]]:
-    """Download an encrypted file (XEP-0454), decrypt it, cache the plaintext.
-
-    Returns (cached_path, mime_type) or (None, None) on failure.
-    """
-    import httpx
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from gateway.platforms.base import cache_image_from_bytes, cache_audio_from_bytes
-
-    match = _AESGCM_URL_RE.match(aesgcm_url)
-    if not match:
-        logger.warning("xmpp: invalid aesgcm:// URL: %s", aesgcm_url)
-        return None, None
-
-    https_path = match.group(1)        # e.g. "upload.example.org/file.jpg"
-    fragment = match.group(2)          # 88 hex chars: IV(24) + key(64)
-
-    if len(fragment) != 88:
-        logger.warning("xmpp: aesgcm:// fragment wrong length (%d)", len(fragment))
-        return None, None
-
-    iv = bytes.fromhex(fragment[:24])
-    key = bytes.fromhex(fragment[24:])
-
-    # Determine MIME type from URL path
-    https_url = "https://" + https_path
-    mime = _guess_mime_from_url(https_url)
-    ext = _mime_to_ext(mime)
-
-    # Download encrypted file
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            response = await client.get(
-                https_url,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
-                    "Accept": "*/*",
-                },
-            )
-            response.raise_for_status()
-            encrypted_data = response.content
-    except Exception as exc:
-        logger.warning("xmpp: failed to download aesgcm:// file %s: %s", https_url, exc)
-        return None, None
-
-    # Decrypt: last 16 bytes are the GCM authentication tag
-    if len(encrypted_data) < 16:
-        logger.warning("xmpp: aesgcm:// file too short (%d bytes)", len(encrypted_data))
-        return None, None
-
-    tag = encrypted_data[-16:]
-    ciphertext = encrypted_data[:-16]
-
-    try:
-        aes_gcm = Cipher(
-            algorithms.AES(key),
-            modes.GCM(iv, tag),
-        ).decryptor()
-        plaintext = aes_gcm.update(ciphertext) + aes_gcm.finalize()
-    except Exception as exc:
-        logger.warning("xmpp: aesgcm:// decryption failed: %s", exc)
-        return None, None
-
-    # Cache decrypted bytes
-    try:
-        if mime.startswith("image/"):
-            cached = cache_image_from_bytes(plaintext, ext)
-        elif mime.startswith("audio/"):
-            cached = cache_audio_from_bytes(plaintext, ext)
-        else:
-            # For documents, use image cache (path doesn't matter for gateway)
-            cached = cache_image_from_bytes(plaintext, ext)
-        logger.debug("xmpp: decrypted aesgcm:// media (%s, %d bytes) → %s", mime, len(plaintext), cached)
-        return cached, mime
-    except Exception as exc:
-        logger.warning("xmpp: aesgcm:// cache failed: %s", exc)
-        return None, None
 
 
 # ----------------------------------------------------------------
@@ -949,7 +873,7 @@ class XmppAdapter(BasePlatformAdapter):
                         pass
 
                 for aesgcm_url in aesgcm_urls:
-                    cached, mime = await _download_and_decrypt_aesgcm(aesgcm_url)
+                    cached, mime = await self._decrypt_aesgcm(aesgcm_url)
                     if cached is not None and mime is not None:
                         aesgcm_media_urls.append(cached)
                         aesgcm_media_types.append(mime)
@@ -2174,6 +2098,51 @@ class XmppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         return await self._upload_and_send(chat_id, path, caption)
 
+    async def _decrypt_aesgcm(self, aesgcm_url: str) -> Tuple[Optional[str], Optional[str]]:
+        """Download an encrypted file (XEP-0454), decrypt it, cache the plaintext.
+
+        Returns (cached_path, mime_type) or (None, None) on failure.
+        """
+        match = _AESGCM_URL_RE.match(aesgcm_url)
+        if not match:
+            logger.warning("xmpp: invalid aesgcm:// URL: %s", aesgcm_url)
+            return None, None
+
+        https_path = match.group(1)
+        fragment = match.group(2)          # 88 hex chars: IV(24) + key(64)
+        https_url = "https://" + https_path
+        mime = _guess_mime_from_url(https_url)
+        ext = _mime_to_ext(mime)
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(
+                    https_url,
+                    headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)", "Accept": "*/*"},
+                )
+                response.raise_for_status()
+                encrypted_data = response.content
+        except Exception as exc:
+            logger.warning("xmpp: failed to download aesgcm:// file %s: %s", https_url, exc)
+            return None, None
+
+        try:
+            plaintext = self.client["xep_0454"].decrypt(BytesIO(encrypted_data), fragment)
+        except Exception as exc:
+            logger.warning("xmpp: aesgcm:// decryption failed: %s", exc)
+            return None, None
+
+        try:
+            if mime.startswith("audio/"):
+                cached = cache_audio_from_bytes(plaintext, ext)
+            else:
+                cached = cache_image_from_bytes(plaintext, ext)
+            logger.debug("xmpp: decrypted aesgcm:// media (%s, %d bytes) → %s", mime, len(plaintext), cached)
+            return cached, mime
+        except Exception as exc:
+            logger.warning("xmpp: aesgcm:// cache failed: %s", exc)
+            return None, None
+
     async def send_video(
         self,
         chat_id: str,
@@ -2195,13 +2164,7 @@ class XmppAdapter(BasePlatformAdapter):
                 retryable=False,
             )
 
-        is_dm = not self._is_muc(chat_id)
-        use_omemo_media = (
-            is_dm
-            and "xep_0454" in self._registered_plugins
-            and "xep_0384" in self._registered_plugins
-            and SLIXMPP_OMEMO_AVAILABLE
-        )
+        use_omemo_media = self._use_omemo_media(chat_id)
 
         content_type, _ = mimetypes.guess_type(path)
         try:
@@ -2501,13 +2464,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         # XEP-0454 OMEMO Media Sharing: for encrypted DMs, encrypt + upload
         # and send the aesgcm:// URL through the OMEMO body path.
-        is_dm = not self._is_muc(chat_id)
-        use_omemo_media = (
-            is_dm
-            and "xep_0454" in self._registered_plugins
-            and "xep_0384" in self._registered_plugins
-            and SLIXMPP_OMEMO_AVAILABLE
-        )
+        use_omemo_media = self._use_omemo_media(chat_id)
         if use_omemo_media:
             # Fall back to _upload_and_send which handles 0454 encryption
             return await self._upload_and_send(chat_id, path, caption="[Voice message]")
@@ -2567,6 +2524,15 @@ class XmppAdapter(BasePlatformAdapter):
 
     def _is_muc(self, chat_id: str) -> bool:
         return chat_id in self._known_mucs
+
+    def _use_omemo_media(self, chat_id: str) -> bool:
+        """Whether to use XEP-0454 OMEMO Media Sharing for file uploads."""
+        return (
+            not self._is_muc(chat_id)
+            and "xep_0454" in self._registered_plugins
+            and "xep_0384" in self._registered_plugins
+            and SLIXMPP_OMEMO_AVAILABLE
+        )
 
     @staticmethod
     def _bare(jid: str) -> str:
