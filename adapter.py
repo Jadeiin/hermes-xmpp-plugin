@@ -2412,24 +2412,32 @@ class XmppAdapter(BasePlatformAdapter):
             return
         try:
             xep_0050 = self.client["xep_0050"]
-            # Register a simple "hermes" command node that lists available actions
             xep_0050.add_command(
                 jid=self.client.boundjid,
                 node="hermes",
                 name="Hermes Agent Commands",
                 handler=self._adhoc_hermes_handler,
             )
+            logger.info(
+                "xmpp: ad-hoc command registered — node=hermes jid=%s",
+                self.client.boundjid,
+            )
         except Exception:
-            logger.debug("xmpp: failed to register ad-hoc commands", exc_info=True)
+            logger.exception("xmpp: failed to register ad-hoc commands")
 
-    async def _adhoc_hermes_handler(self, iq: Any, session: Dict[str, Any]) -> Dict[str, Any]:
+    # ── Stage 1: show the command selection form ─────────────────────
+    async def _adhoc_hermes_handler(
+        self, iq: Any, session: Dict[str, Any]
+    ) -> Dict[str, Any]:
         client = self.client
         if client is None or "xep_0004" not in self._registered_plugins:
             session["notes"] = [("error", "Data forms not available")]
             return session
         try:
             form = client["xep_0004"].make_form(
-                ftype="form", title="Hermes Commands", instructions="Choose a command to execute."
+                ftype="form",
+                title="Hermes Commands",
+                instructions="Choose a command to execute.",
             )
             form.add_field(
                 var="command",
@@ -2442,12 +2450,72 @@ class XmppAdapter(BasePlatformAdapter):
                 ],
             )
             session["payload"] = form
-            session["has_next"] = False
-            session["next"] = None
+            session["has_next"] = True
+            session["next"] = self._adhoc_hermes_execute
+            session["allow_complete"] = False
             return session
         except Exception:
+            logger.exception("xmpp: adhoc stage-1 failed")
             session["notes"] = [("error", "Failed to build command list")]
             return session
+
+    # ── Stage 2: execute the selected command ────────────────────────
+    async def _adhoc_hermes_execute(
+        self, form_result: Any, session: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        client = self.client
+        try:
+            values = form_result.get_values() if hasattr(form_result, "get_values") else {}
+            cmd = values.get("command", "")
+        except Exception:
+            cmd = ""
+
+        if cmd == "status":
+            note_text = self._build_status_text()
+        elif cmd == "help":
+            note_text = self._build_help_text()
+        elif cmd == "ping":
+            note_text = f"🏓 Pong! {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        else:
+            note_text = f"Unknown command: {cmd}"
+
+        session["payload"] = None
+        session["notes"] = [("info", note_text)]
+        session["has_next"] = False
+        session["next"] = None
+        return session
+
+    def _build_status_text(self) -> str:
+        parts = ["🤖 Hermes XMPP Adapter Status", ""]
+        parts.append(f"Connected: {'✅' if self._running else '❌'}")
+        if self.client and self.client.boundjid:
+            parts.append(f"JID: {self.client.boundjid.bare}")
+        parts.append(f"OMEMO: {'✅ enabled' if self._omemo_enabled else '❌ disabled'}")
+        parts.append(f"MAM replay: {'✅' if self._mam_enabled else '❌'}")
+        parts.append(
+            f"Markup: XEP-0394={'✅' if self._xep_0394_enabled else '❌'} "
+            f"XEP-0071={'✅' if self._xep_0071_enabled else '❌'}"
+        )
+        if self.muc_rooms:
+            parts.append("")
+            parts.append("MUC rooms:")
+            for r in self.muc_rooms:
+                parts.append(f"  - {r.room} (nick: {r.nick or self.muc_nick})")
+        return "\n".join(parts)
+
+    def _build_help_text(self) -> str:
+        return (
+            "📋 Available commands:\n\n"
+            "  /stop     — Stop the current agent generation\n"
+            "  /new      — Start a new conversation\n"
+            "  /approve  — Approve a dangerous command\n"
+            "  /deny     — Deny a dangerous command\n\n"
+            "Ad-hoc commands (XEP-0050):\n"
+            "  Status — Show adapter status and connection info\n"
+            "  Help   — Show this help text\n"
+            "  Ping   — Connection latency check\n\n"
+            "For more: https://hermes-agent.nousresearch.com/docs"
+        )
 
     # -----------------------------------------------------------------
     # Voice messages via XEP-0447 SFS

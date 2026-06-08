@@ -897,3 +897,195 @@ class TestInboundAesgcmDecryption:
         assert "and" in event.text
         assert "/tmp/a.jpg" in event.media_urls
         assert "/tmp/b.png" in event.media_urls
+
+
+# ==========================================================================
+# 10. XEP-0050 Ad-Hoc Commands
+# ==========================================================================
+
+class TestAdhocCommands:
+    """Ad-hoc command registration, stage-1 form, stage-2 execution."""
+
+    # ── Registration ────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_setup_registers_command_and_logs(self, adapter_inst):
+        """_setup_adhoc_commands registers command and logs info."""
+        client = MagicMock()
+        client.boundjid = MagicMock()
+        client.boundjid.full = "hermes@example.org/resource"
+        client.boundjid.bare = "hermes@example.org"
+        xep0050 = MagicMock()
+        client.__getitem__ = lambda s, k: xep0050 if k == "xep_0050" else MagicMock()
+        adapter_inst.client = client
+        adapter_inst._registered_plugins.add("xep_0050")
+
+        with unittest.mock.patch.object(adapter.logger, "info") as mock_info:
+            await adapter_inst._setup_adhoc_commands()
+
+        xep0050.add_command.assert_called_once()
+        call_kwargs = xep0050.add_command.call_args
+        assert call_kwargs[1]["node"] == "hermes"
+        assert call_kwargs[1]["name"] == "Hermes Agent Commands"
+        assert call_kwargs[1]["handler"] == adapter_inst._adhoc_hermes_handler
+        mock_info.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_setup_noop_when_plugin_missing(self, adapter_inst):
+        """No crash, no-op when xep_0050 not registered."""
+        adapter_inst.client = MagicMock()
+        adapter_inst._registered_plugins.discard("xep_0050")
+        await adapter_inst._setup_adhoc_commands()
+        # Should not raise
+
+    @pytest.mark.asyncio
+    async def test_setup_logs_exception(self, adapter_inst):
+        """Exception during add_command is logged."""
+        client = MagicMock()
+        client.boundjid = MagicMock()
+        client.boundjid.full = "hermes@example.org/resource"
+        xep0050 = MagicMock()
+        xep0050.add_command.side_effect = RuntimeError("boom")
+        client.__getitem__ = lambda s, k: xep0050 if k == "xep_0050" else MagicMock()
+        adapter_inst.client = client
+        adapter_inst._registered_plugins.add("xep_0050")
+
+        with unittest.mock.patch.object(adapter.logger, "exception") as mock_exc:
+            await adapter_inst._setup_adhoc_commands()
+        mock_exc.assert_called_once()
+
+    # ── Stage 1: command selection form ─────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_stage1_returns_form_with_next(self, adapter_inst):
+        """Stage 1 returns a Data Form with has_next=True and next handler."""
+        client = MagicMock()
+        mock_form = MagicMock()
+        client.__getitem__ = lambda s, k: MagicMock() if k != "xep_0004" else (
+            MagicMock(make_form=MagicMock(return_value=mock_form))
+        )
+        adapter_inst.client = client
+        adapter_inst._registered_plugins.add("xep_0004")
+
+        iq = MagicMock()
+        session: dict = {}
+        session = await adapter_inst._adhoc_hermes_handler(iq, session)
+
+        assert session["payload"] == mock_form
+        assert session["has_next"] is True
+        assert session["next"] == adapter_inst._adhoc_hermes_execute
+        assert session["allow_complete"] is False
+
+    @pytest.mark.asyncio
+    async def test_stage1_fallback_when_xep_0004_missing(self, adapter_inst):
+        """Without xep_0004, return error note."""
+        adapter_inst.client = MagicMock()
+        adapter_inst._registered_plugins.discard("xep_0004")
+
+        session = await adapter_inst._adhoc_hermes_handler(MagicMock(), {})
+        assert session["notes"][0][0] == "error"
+        assert "not available" in session["notes"][0][1]
+
+    # ── Stage 2: command execution ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_stage2_status(self, adapter_inst):
+        """Status command returns adapter status info."""
+        client = MagicMock()
+        client.boundjid = MagicMock()
+        client.boundjid.bare = "hermes@example.org"
+        adapter_inst.client = client
+        adapter_inst._running = True
+        adapter_inst._omemo_enabled = True
+        adapter_inst._mam_enabled = True
+
+        mock_form = MagicMock()
+        mock_form.get_values.return_value = {"command": "status"}
+
+        session: dict = {"id": "sess-1"}
+        session = await adapter_inst._adhoc_hermes_execute(mock_form, session)
+
+        assert session["next"] is None
+        assert session["has_next"] is False
+        assert session["payload"] is None
+        note = session["notes"][0]
+        assert note[0] == "info"
+        assert "Connected: ✅" in note[1]
+        assert "hermes@example.org" in note[1]
+        assert "OMEMO: ✅" in note[1]
+
+    @pytest.mark.asyncio
+    async def test_stage2_status_disconnected(self, adapter_inst):
+        """Status shows disconnected when _running is False."""
+        adapter_inst.client = MagicMock()
+        adapter_inst.client.boundjid = MagicMock()
+        adapter_inst.client.boundjid.bare = "hermes@example.org"
+        adapter_inst._running = False
+        adapter_inst._omemo_enabled = False
+
+        mock_form = MagicMock()
+        mock_form.get_values.return_value = {"command": "status"}
+
+        session = await adapter_inst._adhoc_hermes_execute(mock_form, {})
+        note = session["notes"][0]
+        assert "Connected: ❌" in note[1]
+        assert "OMEMO: ❌" in note[1]
+
+    @pytest.mark.asyncio
+    async def test_stage2_status_with_muc_rooms(self, adapter_inst):
+        """Status lists MUC rooms when configured."""
+        adapter_inst.client = MagicMock()
+        adapter_inst.client.boundjid = MagicMock()
+        adapter_inst.client.boundjid.bare = "hermes@example.org"
+        adapter_inst._running = True
+        adapter_inst._omemo_enabled = True
+
+        from adapter import _MucRoom
+        adapter_inst.muc_rooms = [
+            _MucRoom("room1@conf.example.org", "hermes"),
+            _MucRoom("room2@conf.example.org", "bot"),
+        ]
+
+        mock_form = MagicMock()
+        mock_form.get_values.return_value = {"command": "status"}
+
+        session = await adapter_inst._adhoc_hermes_execute(mock_form, {})
+        note = session["notes"][0]
+        assert "room1@conf.example.org" in note[1]
+        assert "room2@conf.example.org" in note[1]
+
+    @pytest.mark.asyncio
+    async def test_stage2_help(self, adapter_inst):
+        """Help command returns usage text."""
+        mock_form = MagicMock()
+        mock_form.get_values.return_value = {"command": "help"}
+
+        session = await adapter_inst._adhoc_hermes_execute(mock_form, {})
+        note = session["notes"][0]
+        assert "/stop" in note[1]
+        assert "/new" in note[1]
+        assert "/approve" in note[1]
+        assert "/deny" in note[1]
+
+    @pytest.mark.asyncio
+    async def test_stage2_ping(self, adapter_inst):
+        """Ping command returns pong with timestamp."""
+        mock_form = MagicMock()
+        mock_form.get_values.return_value = {"command": "ping"}
+
+        session = await adapter_inst._adhoc_hermes_execute(mock_form, {})
+        note = session["notes"][0]
+        assert "🏓 Pong!" in note[1]
+        # Should contain a UTC timestamp
+        assert "UTC" in note[1]
+
+    @pytest.mark.asyncio
+    async def test_stage2_unknown_command(self, adapter_inst):
+        """Unknown command shows error note."""
+        mock_form = MagicMock()
+        mock_form.get_values.return_value = {"command": "bogus"}
+
+        session = await adapter_inst._adhoc_hermes_execute(mock_form, {})
+        note = session["notes"][0]
+        assert "Unknown" in note[1]
+        assert "bogus" in note[1]
