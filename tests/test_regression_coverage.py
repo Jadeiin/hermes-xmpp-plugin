@@ -1127,3 +1127,105 @@ class TestAdhocCommands:
         note = session["notes"][0]
         assert "Unknown" in note[1]
         assert "bogus" in note[1]
+
+
+# ==========================================================================
+# 11. XEP-0444 MUC self-reaction guard & auth
+# ==========================================================================
+
+class TestMucReactionGuard:
+    """_on_reaction must ignore the bot's own seed reactions in MUC
+    and use correct auth context (group vs dm)."""
+
+    @pytest.mark.asyncio
+    async def test_self_reaction_ignored_in_muc(self, adapter_inst):
+        """Bot's own seed reaction in MUC is ignored via nick check."""
+        adapter_inst._known_mucs.add("room@conf.example.org")
+        adapter_inst._self_bare = "hermes@jabjab.de"
+
+        # Bot's own reaction comes from room@conf/bot-nick
+        message = MagicMock()
+        message.__getitem__ = lambda s, k: {
+            "from": "room@conf.example.org/hermes",
+            "reactions": MagicMock(
+                xml=MagicMock(),
+                **{"__getitem__": lambda s, k: "msg-1" if k == "id" else None},
+                __iter__=lambda s: iter([
+                    MagicMock(**{"__getitem__": lambda s, k: "✅" if k == "value" else None})
+                ]),
+            ),
+        }.get(k, None)
+
+        adapter_inst._approval_prompts_by_event = {"msg-1": {"resolved": False, "session_key": "sk"}}
+        resolve_calls = []
+
+        async def fake_resolve(*args):
+            resolve_calls.append(args)
+
+        adapter_inst._resolve_approval_reaction = fake_resolve
+
+        adapter_inst._on_reaction(message)
+        # Must NOT have called resolve — self-reaction was ignored
+        assert len(resolve_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_muc_user_reaction_uses_group_auth(self, adapter_inst):
+        """Reaction from MUC user passes auth with group context."""
+        adapter_inst._known_mucs.add("room@conf.example.org")
+        adapter_inst._self_bare = "hermes@jabjab.de"
+        adapter_inst.allow_all_users = False
+        adapter_inst.allowed_users = set()
+
+        message = MagicMock()
+        message.__getitem__ = lambda s, k: {
+            "from": "room@conf.example.org/poesty",
+            "reactions": MagicMock(
+                xml=MagicMock(),
+                **{"__getitem__": lambda s, k: "msg-2" if k == "id" else None},
+                __iter__=lambda s: iter([
+                    MagicMock(**{"__getitem__": lambda s, k: "✅" if k == "value" else None})
+                ]),
+            ),
+        }.get(k, None)
+
+        # Mock _muc_real_jid to return the real JID
+        adapter_inst._muc_real_jid = lambda msg: "poesty@jabjab.de"
+
+        adapter_inst._approval_prompts_by_event = {
+            "msg-2": {"resolved": False, "session_key": "sk"}
+        }
+        resolve_calls = []
+
+        async def fake_resolve(*args):
+            resolve_calls.append(args)
+
+        adapter_inst._resolve_approval_reaction = fake_resolve
+
+        adapter_inst._on_reaction(message)
+        # ensure_future schedules the task – let it execute
+        await asyncio.sleep(0)
+        assert len(resolve_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_own_reaction_ignored_in_dm(self, adapter_inst):
+        """DM self-reaction is ignored via bare JID check."""
+        adapter_inst._self_bare = "hermes@jabjab.de"
+
+        message = MagicMock()
+        message.__getitem__ = lambda s, k: {
+            "from": "hermes@jabjab.de/resource",
+            "reactions": MagicMock(
+                xml=MagicMock(),
+                **{"__getitem__": lambda s, k: "msg-3" if k == "id" else None},
+            ),
+        }.get(k, None)
+
+        adapter_inst._approval_prompts_by_event = {"msg-3": {"resolved": False}}
+        resolve_calls = []
+
+        async def fake_resolve(*args):
+            resolve_calls.append(args)
+
+        adapter_inst._resolve_approval_reaction = fake_resolve
+        adapter_inst._on_reaction(message)
+        assert len(resolve_calls) == 0

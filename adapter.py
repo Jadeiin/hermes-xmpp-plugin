@@ -1864,8 +1864,31 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception:
             return
 
+        # ── Self-reaction guards ────────────────────────────────────
+        # DM: compare bare JID directly.
         if from_bare == self._self_bare:
-            return  # ignore own reactions
+            return
+        # MUC: compare resource (nick) against bot's nick for this room.
+        # In MUC the message["from"] is room@conf/nick — not the bot's
+        # own JID — so the DM guard above doesn't catch it.
+        if from_bare in self._known_mucs:
+            resource = from_full.split("/", 1)[1] if "/" in from_full else ""
+            our_nick = self._muc_nick_for_room(from_bare)
+            if resource and our_nick and resource == our_nick:
+                return  # own seed reaction echoed back by MUC
+
+        # ── Determine auth context ──────────────────────────────────
+        # In MUC, from_bare is the room JID.  Try to extract the real
+        # sender JID from the MUC <x> element for user-level auth.
+        # Fall back to room-level auth if the MUC is anonymous.
+        is_muc = from_bare in self._known_mucs
+        if is_muc:
+            real_jid = self._muc_real_jid(message)
+            auth_user = real_jid if real_jid else from_bare
+            auth_chat_type = "group"
+        else:
+            auth_user = from_bare
+            auth_chat_type = "dm"
 
         try:
             reactions_el = message["reactions"]
@@ -1891,7 +1914,8 @@ class XmppAdapter(BasePlatformAdapter):
                     choice = self._approval_reaction_map.get(rxn_val)
                     if choice:
                         if self._is_authorized(
-                            chat_type="dm", chat_id=from_bare, user_jid=from_bare
+                            chat_type=auth_chat_type, chat_id=from_bare,
+                            user_jid=auth_user,
                         ):
                             asyncio.ensure_future(
                                 self._resolve_approval_reaction(
@@ -1904,7 +1928,8 @@ class XmppAdapter(BasePlatformAdapter):
                 clarify_prompt = self._clarify_prompts_by_event.get(target_id)
                 if clarify_prompt and not clarify_prompt.get("resolved"):
                     if self._is_authorized(
-                        chat_type="dm", chat_id=from_bare, user_jid=from_bare
+                        chat_type=auth_chat_type, chat_id=from_bare,
+                        user_jid=auth_user,
                     ):
                         asyncio.ensure_future(
                             self._resolve_clarify_reaction(
