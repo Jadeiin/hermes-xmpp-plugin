@@ -2429,6 +2429,19 @@ class XmppAdapter(BasePlatformAdapter):
     async def _adhoc_hermes_handler(
         self, iq: Any, session: Dict[str, Any]
     ) -> Dict[str, Any]:
+        # ── Access control ──────────────────────────────────────────
+        # slixmpp XEP-0050 does NOT filter by sender — the spec
+        # delegates access control to the handler.
+        from_jid = self._bare(str(iq.get_from())) if iq.get_from() else None
+        if from_jid and not self._is_authorized(
+            chat_type="dm", chat_id=from_jid, user_jid=from_jid
+        ):
+            logger.warning(
+                "xmpp: adhoc command denied for unauthorized %s", from_jid
+            )
+            session["notes"] = [("error", "Access denied")]
+            return session
+
         client = self.client
         if client is None or "xep_0004" not in self._registered_plugins:
             session["notes"] = [("error", "Data forms not available")]

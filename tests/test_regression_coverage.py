@@ -986,6 +986,44 @@ class TestAdhocCommands:
         assert session["notes"][0][0] == "error"
         assert "not available" in session["notes"][0][1]
 
+    @pytest.mark.asyncio
+    async def test_stage1_access_denied_for_unauthorized(self, adapter_inst):
+        """Unauthorized JID gets 'Access denied' error."""
+        client = MagicMock()
+        client.__getitem__ = lambda s, k: MagicMock()
+        adapter_inst.client = client
+        adapter_inst._registered_plugins.add("xep_0004")
+        adapter_inst.allow_all_users = False
+        adapter_inst.allowed_users = {"trusted@example.org"}
+        adapter_inst._authorized_users = {"trusted@example.org"}
+
+        iq = MagicMock()
+        iq.get_from.return_value = "stranger@evil.example.org/resource"
+
+        session = await adapter_inst._adhoc_hermes_handler(iq, {})
+        assert session["notes"][0][0] == "error"
+        assert "Access denied" in session["notes"][0][1]
+
+    @pytest.mark.asyncio
+    async def test_stage1_access_granted_for_authorized(self, adapter_inst):
+        """Authorized JID passes access control to form."""
+        mock_form = MagicMock()
+        client = MagicMock()
+        client.__getitem__ = lambda s, k: (
+            MagicMock(make_form=MagicMock(return_value=mock_form))
+            if k == "xep_0004" else MagicMock()
+        )
+        adapter_inst.client = client
+        adapter_inst._registered_plugins.add("xep_0004")
+        adapter_inst.allow_all_users = True  # gateway pairing mode
+
+        iq = MagicMock()
+        iq.get_from.return_value = "anyone@example.org/resource"
+
+        session = await adapter_inst._adhoc_hermes_handler(iq, {})
+        assert session["payload"] == mock_form
+        assert "Access denied" not in str(session.get("notes", ""))
+
     # ── Stage 2: command execution ──────────────────────────────────
 
     @pytest.mark.asyncio
