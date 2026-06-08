@@ -2049,6 +2049,11 @@ class XmppAdapter(BasePlatformAdapter):
 
         result = await self.send(chat_id, text, metadata=metadata)
         if not result.success or not result.message_id:
+            logger.warning(
+                "xmpp: send_exec_approval — send returned success=%s message_id=%s, "
+                "skipping reactions",
+                result.success, result.message_id,
+            )
             return result
 
         prompt = {
@@ -2074,9 +2079,13 @@ class XmppAdapter(BasePlatformAdapter):
             )
             msg.enable("store")
             msg.send()
+            logger.info(
+                "xmpp: sent approval reactions [✅, ❎] on msg %s in %s",
+                result.message_id, chat_id,
+            )
         except Exception as exc:
-            logger.debug(
-                "xmpp: failed to add approval reactions: %s", exc
+            logger.warning(
+                "xmpp: failed to add approval reactions: %s", exc, exc_info=True
             )
 
         return result
