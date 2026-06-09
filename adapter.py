@@ -486,12 +486,20 @@ class XmppAdapter(BasePlatformAdapter):
 
         client = ClientXMPP(self.jid, self._password)
         # Plugins - core
-        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0198", "xep_0199", "xep_0363"):
+        for plugin in ("xep_0030", "xep_0045", "xep_0066", "xep_0085", "xep_0198", "xep_0363"):
             try:
                 client.register_plugin(plugin)
                 self._registered_plugins.add(plugin)
             except Exception:
                 logger.warning("xmpp: failed to register slixmpp plugin %s", plugin)
+        # XEP-0199 ping keepalive — fast disconnect detection (30s interval, 10s timeout)
+        # keepalive=True triggers plugin_init to register session_start/session_resumed
+        # auto-restart handlers, so no manual enable_keepalive() needed.
+        try:
+            client.register_plugin("xep_0199", {"keepalive": True, "interval": 30, "timeout": 10})
+            self._registered_plugins.add("xep_0199")
+        except Exception:
+            logger.warning("xmpp: failed to register slixmpp plugin xep_0199 with keepalive")
 
         # Plugins - first-class features (XEP-0394, 0444, 0004, 0050, 0461, 0447)
         # Lazy-load: if slixmpp doesn't have them the adapter continues without them.
