@@ -57,60 +57,27 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig  # pyright: ignore[reportMissingImports]
 from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
     BasePlatformAdapter,
+    CachedMedia,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
     SendResult,
-    cache_audio_from_bytes,
-    cache_audio_from_url,
-    cache_image_from_bytes,
-    cache_image_from_url,
+    cache_media_bytes,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------
-# MIME → extension mapping for inbound media downloads
+# AES-GCM URL pattern (XEP-0454 OMEMO Media Sharing)
+# Format: aesgcm://<host>/<path>#<IV(24 hex)><key(64 hex)>
+# Replaces the old hand-rolled MIME/extension dispatch tables — all
+# inbound media now flows through ``cache_media_bytes()`` (gateway base),
+# which uses the canonical SUPPORTED_*_TYPES tables and is the same
+# helper Telegram and Teams use.
 # ----------------------------------------------------------------
-_MIME_TO_EXT: Dict[str, str] = {
-    # Audio
-    "audio/ogg": ".ogg",
-    "audio/opus": ".opus",
-    "audio/mpeg": ".mp3",
-    "audio/mp3": ".mp3",
-    "audio/mp4": ".m4a",
-    "audio/aac": ".aac",
-    "audio/wav": ".wav",
-    "audio/webm": ".weba",
-    "audio/x-m4a": ".m4a",
-    # Image
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "image/svg+xml": ".svg",
-    "image/bmp": ".bmp",
-    "image/tiff": ".tiff",
-    # Video
-    "video/mp4": ".mp4",
-    "video/webm": ".webm",
-    "video/ogg": ".ogv",
-    "video/quicktime": ".mov",
-    "video/x-matroska": ".mkv",
-    # Documents
-    "application/pdf": ".pdf",
-    "application/zip": ".zip",
-    "application/gzip": ".gz",
-    "application/x-tar": ".tar",
-    "text/plain": ".txt",
-    "text/html": ".html",
-}
 
-
-def _mime_to_ext(mime: str) -> str:
-    """Map a MIME type to a file extension (including the dot)."""
-    return _MIME_TO_EXT.get(mime, ".bin")
+_AESGCM_URL_RE = re.compile(r"aesgcm://([^\s#]+)#([0-9a-fA-F]{88})")
 
 
 def _mime_to_message_type(mime: str, *, body: Optional[str] = None) -> MessageType:
@@ -141,48 +108,6 @@ def _mime_to_message_type(mime: str, *, body: Optional[str] = None) -> MessageTy
             return MessageType.VOICE
         return MessageType.AUDIO
     return MessageType.DOCUMENT
-
-
-def _guess_mime_from_url(url: str) -> str:
-    """Guess MIME type from a URL's file extension."""
-    from urllib.parse import urlparse
-
-    path = urlparse(url).path.lower()
-    ext_to_mime = {
-        # Audio
-        ".ogg": "audio/ogg",
-        ".opus": "audio/opus",
-        ".mp3": "audio/mpeg",
-        ".m4a": "audio/mp4",
-        ".aac": "audio/aac",
-        ".wav": "audio/wav",
-        ".weba": "audio/webm",
-        # Image
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".png": "image/png",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-        ".svg": "image/svg+xml",
-        ".bmp": "image/bmp",
-        # Video
-        ".mp4": "video/mp4",
-        ".webm": "video/webm",
-        ".ogv": "video/ogg",
-        ".mov": "video/quicktime",
-        ".mkv": "video/x-matroska",
-        # Documents
-        ".pdf": "application/pdf",
-        ".zip": "application/zip",
-        ".gz": "application/gzip",
-        ".tar": "application/x-tar",
-        ".txt": "text/plain",
-        ".html": "text/html",
-    }
-    for ext, mime in ext_to_mime.items():
-        if path.endswith(ext):
-            return mime
-    return "application/octet-stream"
 
 
 # aesgcm:// URL pattern — XEP-0454 OMEMO Media Sharing inbound.
@@ -922,34 +847,30 @@ class XmppAdapter(BasePlatformAdapter):
                         pass  # no SFS element or plugin not active
 
                 for url in sfs_urls:
-                    try:
-                        mime = sfs_media or _guess_mime_from_url(url)
-                        ext = _mime_to_ext(mime)
-                        if mime.startswith("image/"):
-                            cached = await cache_image_from_url(url, ext=ext)
-                        else:
-                            cached = await cache_audio_from_url(url, ext=ext)
-                        media_urls.append(cached)
-                        media_types.append(mime)
-                        logger.debug("xmpp: cached SFS media (%s) from %s → %s", mime, url, cached)
-                    except Exception as exc:
-                        logger.warning("xmpp: failed to download SFS media %s: %s", url, exc)
+                    cached = await self._download_and_cache_media(
+                        url, mime_hint=sfs_media or ""
+                    )
+                    if cached is not None:
+                        media_urls.append(cached.path)
+                        media_types.append(cached.media_type)
+                        logger.debug(
+                            "xmpp: cached SFS media (%s) from %s → %s",
+                            cached.media_type, url, cached.path,
+                        )
 
                 # OOB (XEP-0066) — fallback for older clients
                 if not sfs_urls and "xep_0066" in self._registered_plugins:
                     try:
                         oob_url = stanza_to_dispatch["oob"]["url"]
                         if oob_url:
-                            url_str = str(oob_url)
-                            mime = _guess_mime_from_url(url_str)
-                            ext = _mime_to_ext(mime)
-                            if mime.startswith("image/"):
-                                cached = await cache_image_from_url(url_str, ext=ext)
-                            else:
-                                cached = await cache_audio_from_url(url_str, ext=ext)
-                            media_urls.append(cached)
-                            media_types.append(mime)
-                            logger.debug("xmpp: cached OOB media (%s) from %s → %s", mime, url_str, cached)
+                            cached = await self._download_and_cache_media(str(oob_url))
+                            if cached is not None:
+                                media_urls.append(cached.path)
+                                media_types.append(cached.media_type)
+                                logger.debug(
+                                    "xmpp: cached OOB media (%s) from %s → %s",
+                                    cached.media_type, oob_url, cached.path,
+                                )
                     except Exception:
                         pass  # no OOB element
 
@@ -2140,10 +2061,55 @@ class XmppAdapter(BasePlatformAdapter):
     ) -> SendResult:
         return await self._upload_and_send(chat_id, path, caption)
 
+    async def _download_and_cache_media(
+        self, url: str, mime_hint: str = ""
+    ) -> Optional[CachedMedia]:
+        """Download a URL and cache the bytes via the gateway's unified helper.
+
+        Returns a ``CachedMedia`` (path, media_type, kind, display_name) or
+        ``None`` on failure. Used by both the SFS (XEP-0447) and OOB (XEP-0066)
+        inbound paths, which previously carried the same bug class as the
+        aesgcm path: any non-image file (.docx, .pdf, .mp4, …) was routed to
+        the audio cache, silently corrupting cache filenames or rejecting
+        unknown bytes outright.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                response = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                        "Accept": "*/*",
+                    },
+                )
+                response.raise_for_status()
+                data = response.content
+        except Exception as exc:
+            logger.warning("xmpp: failed to download %s: %s", url, exc)
+            return None
+
+        # Pull a friendly filename from the URL path so the cached file
+        # ends up named after the original upload (Telegram/Teams behave
+        # the same way — see cache_media_bytes callers in those plugins).
+        from urllib.parse import urlparse
+        filename = urlparse(url).path.rsplit("/", 1)[-1] or "file"
+
+        try:
+            return cache_media_bytes(data, filename=filename, mime_type=mime_hint)
+        except Exception as exc:
+            logger.warning("xmpp: failed to cache %s: %s", url, exc)
+            return None
+
     async def _decrypt_aesgcm(self, aesgcm_url: str) -> Tuple[Optional[str], Optional[str]]:
         """Download an encrypted file (XEP-0454), decrypt it, cache the plaintext.
 
         Returns (cached_path, mime_type) or (None, None) on failure.
+
+        The decrypted bytes are routed through ``cache_media_bytes()`` —
+        the same gateway helper used by SFS, OOB, Teams, and Telegram.
+        This means new file types added to ``SUPPORTED_*_TYPES`` in
+        ``gateway/platforms/base.py`` are picked up automatically; we no
+        longer maintain a parallel dispatch table here.
         """
         match = _AESGCM_URL_RE.match(aesgcm_url)
         if not match:
@@ -2153,14 +2119,18 @@ class XmppAdapter(BasePlatformAdapter):
         https_path = match.group(1)
         fragment = match.group(2)          # 88 hex chars: IV(24) + key(64)
         https_url = "https://" + https_path
-        mime = _guess_mime_from_url(https_url)
-        ext = _mime_to_ext(mime)
+
+        from urllib.parse import urlparse
+        filename = urlparse(https_url).path.rsplit("/", 1)[-1] or "file"
 
         try:
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
                 response = await client.get(
                     https_url,
-                    headers={"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)", "Accept": "*/*"},
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)",
+                        "Accept": "*/*",
+                    },
                 )
                 response.raise_for_status()
                 encrypted_data = response.content
@@ -2175,15 +2145,21 @@ class XmppAdapter(BasePlatformAdapter):
             return None, None
 
         try:
-            if mime.startswith("audio/"):
-                cached = cache_audio_from_bytes(plaintext, ext)
-            else:
-                cached = cache_image_from_bytes(plaintext, ext)
-            logger.debug("xmpp: decrypted aesgcm:// media (%s, %d bytes) → %s", mime, len(plaintext), cached)
-            return cached, mime
+            cached = cache_media_bytes(plaintext, filename=filename, mime_type="")
         except Exception as exc:
             logger.warning("xmpp: aesgcm:// cache failed: %s", exc)
             return None, None
+        if cached is None:
+            # Only happens on image validation failure — decrypt produced
+            # bytes that don't look like a valid image. A .docx or .pdf
+            # would never reach here because the dispatch is filename-driven.
+            logger.warning("xmpp: aesgcm:// cache rejected plaintext for %s", filename)
+            return None, None
+        logger.debug(
+            "xmpp: decrypted aesgcm:// media (%s, %d bytes) → %s",
+            cached.media_type, len(plaintext), cached.path,
+        )
+        return cached.path, cached.media_type
 
     async def send_video(
         self,

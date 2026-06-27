@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -76,8 +76,6 @@ async def _mock_cache(url: str, ext: str = ".ogg") -> str:
     return f"/tmp/mock{ext}"
 gw_base.cache_audio_from_url = _mock_cache
 gw_base.cache_image_from_url = _mock_cache
-gw_base.cache_image_from_bytes = lambda data, ext=".jpg": f"/tmp/mock_decrypted{ext}"
-gw_base.cache_audio_from_bytes = lambda data, ext=".ogg": f"/tmp/mock_decrypted{ext}"
 
 def _mock_truncate(self, content, max_len, **kw):
     if max_len <= 0 or len(content) <= max_len:
@@ -900,6 +898,356 @@ class TestInboundAesgcmDecryption:
 
 
 # ==========================================================================
+# 12b. _decrypt_aesgcm + _download_and_cache_media → cache_media_bytes
+# ==========================================================================
+# Regression coverage for the bug where .docx (and other non-image,
+# non-audio) aesgcm:// files were routed to cache_image_from_bytes and
+# rejected with "Refusing to cache non-image data". The fix routes every
+# inbound media path through ``gateway.platforms.base.cache_media_bytes``
+# (the same helper used by SFS, OOB, Teams, and Telegram), so the dispatch
+# is no longer maintained in this plugin. These tests verify the adapter
+# wires up the helper correctly — the dispatch itself is exercised
+# exhaustively in tests/gateway/test_document_cache.py.
+
+class TestAesgcmCacheRouting:
+    """_decrypt_aesgcm and _download_and_cache_media must call cache_media_bytes."""
+
+    @pytest.fixture
+    def adapter_and_mod(self):
+        """Force a fresh adapter module + instance for these tests.
+
+        Other test files (test_e2e_flows.py, test_first_class_features.py)
+        do `del sys.modules['adapter']; import adapter` to force-reload.
+        If we reuse the top-level `adapter` reference, our patches land on
+        a stale module while `_decrypt_aesgcm` looks up names in the new
+        module. Reload here to get a coherent module + instance pair.
+        """
+        for key in list(sys.modules.keys()):
+            if key == "adapter" or key.startswith("adapter."):
+                del sys.modules[key]
+        import adapter as fresh_adapter
+        cfg = MagicMock()
+        cfg.jid = "hermes@example.org"
+        cfg.password = "secret"
+        cfg.home_channel = None
+        cfg.fileserver_url = None
+        inst = fresh_adapter.XmppAdapter(cfg)
+        inst._self_bare = "hermes@example.org"
+        inst._known_mucs = set()
+        inst._authorized_users = {"trusted@example.org"}
+        inst.allow_all_users = True
+        inst.build_source = lambda **kw: MagicMock()
+        room_cfg = MagicMock()
+        room_cfg.room = "room@conf.example.org"
+        room_cfg.nick = "hermes"
+        inst.muc_rooms = [room_cfg]
+        inst.muc_nick = "hermes"
+        return fresh_adapter, inst
+
+    def _mock_httpx(self, adapter_module):
+        """Patch httpx.AsyncClient so downloads return a fixed ciphertext."""
+        class _FakeResp:
+            content = b"<<ct>>"
+            def raise_for_status(self): pass
+        class _FakeAC:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **kw): return _FakeResp()
+        return patch.object(adapter_module.httpx, "AsyncClient", _FakeAC)
+
+    def _stub_xep_0454(self, inst, plaintext):
+        """Patch the xep_0454 plugin on `inst.client` to return `plaintext`."""
+        xep_0454 = MagicMock()
+        xep_0454.decrypt = MagicMock(return_value=plaintext)
+        inst.client = MagicMock()
+        inst.client.__getitem__ = lambda s, k: xep_0454 if k == "xep_0454" else MagicMock()
+
+    def _fake_cached_media(self, path, media_type, kind="document", display="file"):
+        """Build a CachedMedia-shaped MagicMock."""
+        m = MagicMock()
+        m.path = path
+        m.media_type = media_type
+        m.kind = kind
+        m.display_name = display
+        return m
+
+    @pytest.mark.asyncio
+    async def test_decrypt_routes_through_cache_media_bytes(self, adapter_and_mod):
+        """All decrypted blobs must flow through cache_media_bytes — not the
+        legacy per-mime cache_*_from_bytes helpers (which would reject
+        .docx as "non-image data")."""
+        _adapter, adapter_inst = adapter_and_mod
+        # ZIP magic bytes = the plaintext shape of a real .docx
+        plaintext = b"PK\x03\x04" + b"\x00" * 20
+        aesgcm = (
+            "aesgcm://www.jabjab.de:5443/upload/abc/report.docx#"
+            + "ab" * 44
+        )
+
+        seen = {"calls": []}
+
+        def fake_cache_media_bytes(data, *, filename="", mime_type="", default_kind=None):
+            seen["calls"].append({
+                "filename": filename,
+                "mime_type": mime_type,
+                "data_len": len(data),
+            })
+            return self._fake_cached_media(
+                f"/tmp/cache/{filename}", "application/octet-stream",
+                kind="document", display=filename,
+            )
+
+        self._stub_xep_0454(adapter_inst, plaintext)
+        with patch.object(_adapter, "cache_media_bytes", fake_cache_media_bytes), \
+             self._mock_httpx(_adapter):
+            cached, mime = await adapter_inst._decrypt_aesgcm(aesgcm)
+
+        # cache_media_bytes was called exactly once with the right args
+        assert len(seen["calls"]) == 1, seen
+        call = seen["calls"][0]
+        # Filename derived from the URL path (not just "file.bin" or similar)
+        assert call["filename"] == "report.docx"
+        # mime_type is empty (we let cache_media_bytes infer from filename)
+        assert call["mime_type"] == ""
+        # Plaintext bytes were passed (decryption happened)
+        assert call["data_len"] == len(plaintext)
+        # Returned path+mime come from CachedMedia
+        assert cached == "/tmp/cache/report.docx"
+        assert mime == "application/octet-stream"
+
+    @pytest.mark.asyncio
+    async def test_decrypt_propagates_cached_media_type(self, adapter_and_mod):
+        """If cache_media_bytes resolves a specific mime (e.g. PDF), we return it."""
+        _adapter, adapter_inst = adapter_and_mod
+        plaintext = b"%PDF-1.4\n" + b"\x00" * 20
+        aesgcm = "aesgcm://example.org/files/paper.pdf#" + "cd" * 44
+
+        with patch.object(
+            _adapter, "cache_media_bytes",
+            lambda data, filename="", mime_type="", default_kind=None: self._fake_cached_media(
+                f"/tmp/cache/{filename}", "application/pdf", kind="document", display=filename
+            ),
+        ), self._mock_httpx(_adapter):
+            adapter_inst.client = MagicMock()
+            adapter_inst.client.__getitem__ = lambda s, k: MagicMock(
+                decrypt=MagicMock(return_value=plaintext)
+            ) if k == "xep_0454" else MagicMock()
+            cached, mime = await adapter_inst._decrypt_aesgcm(aesgcm)
+
+        # The mime returned by cache_media_bytes is what we hand back
+        assert mime == "application/pdf"
+        assert cached == "/tmp/cache/paper.pdf"
+
+    @pytest.mark.asyncio
+    async def test_decrypt_image_validation_failure_returns_none(self, adapter_and_mod):
+        """cache_media_bytes returns None only for image validation failure.
+        We must surface (None, None) in that case (no implicit fallback)."""
+        _adapter, adapter_inst = adapter_and_mod
+        plaintext = b"\xff\xd8\xff\xe0" + b"\x00" * 20
+        aesgcm = "aesgcm://example.org/p/photo.jpg#" + "12" * 44
+
+        with patch.object(
+            _adapter, "cache_media_bytes",
+            lambda data, filename="", mime_type="", default_kind=None: None,  # validation fail
+        ), self._mock_httpx(_adapter):
+            adapter_inst.client = MagicMock()
+            adapter_inst.client.__getitem__ = lambda s, k: MagicMock(
+                decrypt=MagicMock(return_value=plaintext)
+            ) if k == "xep_0454" else MagicMock()
+            cached, mime = await adapter_inst._decrypt_aesgcm(aesgcm)
+
+        assert cached is None
+        assert mime is None
+
+    @pytest.mark.asyncio
+    async def test_decrypt_invalid_url_returns_none(self, adapter_and_mod):
+        """A malformed aesgcm:// URL (wrong fragment length) → (None, None)."""
+        _adapter, adapter_inst = adapter_and_mod
+        bad = "aesgcm://example.org/x.jpg#" + "ff" * 43  # 86 hex, not 88
+
+        called = {"cache": False}
+        with patch.object(
+            _adapter, "cache_media_bytes",
+            lambda *a, **kw: (called.update(cache=True) or self._fake_cached_media("x", "y")),
+        ), self._mock_httpx(_adapter):
+            adapter_inst.client = MagicMock()
+            cached, mime = await adapter_inst._decrypt_aesgcm(bad)
+
+        assert cached is None
+        assert mime is None
+        assert called["cache"] is False  # never reached the cache
+
+    @pytest.mark.asyncio
+    async def test_decrypt_download_failure_returns_none(self, adapter_and_mod):
+        """HTTP failure during download → (None, None), no cache call."""
+        _adapter, adapter_inst = adapter_and_mod
+        plaintext = b"PK\x03\x04"
+        aesgcm = "aesgcm://example.org/x.docx#" + "ab" * 44
+
+        # httpx that always raises
+        class _FailingAC:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **kw):
+                raise RuntimeError("network down")
+
+        with patch.object(_adapter.httpx, "AsyncClient", _FailingAC):
+            adapter_inst.client = MagicMock()
+            adapter_inst.client.__getitem__ = lambda s, k: MagicMock(
+                decrypt=MagicMock(return_value=plaintext)
+            ) if k == "xep_0454" else MagicMock()
+            cached, mime = await adapter_inst._decrypt_aesgcm(aesgcm)
+
+        assert cached is None
+        assert mime is None
+
+
+# ==========================================================================
+# 12c. _download_and_cache_media — SFS/OOB helper
+# ==========================================================================
+# The SFS (XEP-0447) and OOB (XEP-0066) paths share a helper that
+# downloads a URL and dispatches via cache_media_bytes. This is the
+# structural fix for the same bug class as aesgcm: the old code routed
+# every non-image file through cache_audio_from_url, breaking .docx,
+# .pdf, .mp4, etc. in plain (unencrypted) SFS/OOB attachments.
+
+class TestDownloadAndCacheMedia:
+    """The SFS/OOB helper must route everything through cache_media_bytes."""
+
+    @pytest.fixture
+    def adapter_and_mod(self):
+        for key in list(sys.modules.keys()):
+            if key == "adapter" or key.startswith("adapter."):
+                del sys.modules[key]
+        import adapter as fresh_adapter
+        cfg = MagicMock()
+        cfg.jid = "hermes@example.org"
+        cfg.password = "secret"
+        cfg.home_channel = None
+        cfg.fileserver_url = None
+        inst = fresh_adapter.XmppAdapter(cfg)
+        inst._self_bare = "hermes@example.org"
+        inst._known_mucs = set()
+        inst._authorized_users = {"trusted@example.org"}
+        inst.allow_all_users = True
+        inst.build_source = lambda **kw: MagicMock()
+        room_cfg = MagicMock()
+        room_cfg.room = "room@conf.example.org"
+        room_cfg.nick = "hermes"
+        inst.muc_rooms = [room_cfg]
+        inst.muc_nick = "hermes"
+        return fresh_adapter, inst
+
+    def _mock_httpx_with_data(self, adapter_module, payload: bytes):
+        """Patch httpx to return `payload` for .get()."""
+        class _FakeResp:
+            content = payload
+            def raise_for_status(self): pass
+        class _FakeAC:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **kw): return _FakeResp()
+        return patch.object(adapter_module.httpx, "AsyncClient", _FakeAC)
+
+    @pytest.mark.asyncio
+    async def test_docx_url_routes_to_document(self, adapter_and_mod):
+        """SFS .docx: must NOT go to image/audio cache (regression of the
+        same bug class as the aesgcm path)."""
+        _adapter, adapter_inst = adapter_and_mod
+
+        seen = {"filename": None, "mime_hint": None}
+
+        def fake_cache(data, *, filename="", mime_type="", default_kind=None):
+            seen["filename"] = filename
+            seen["mime_hint"] = mime_type
+            m = MagicMock()
+            m.path = f"/tmp/cache/{filename}"
+            m.media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            m.kind = "document"
+            m.display_name = filename
+            return m
+
+        with patch.object(_adapter, "cache_media_bytes", fake_cache), \
+             self._mock_httpx_with_data(_adapter, b"PK\x03\x04docxbody"):
+            result = await adapter_inst._download_and_cache_media(
+                "https://upload.example.org/files/report.docx"
+            )
+
+        # Filename preserved from URL path
+        assert seen["filename"] == "report.docx"
+        # No mime hint when caller didn't provide one
+        assert seen["mime_hint"] == ""
+        # Returned CachedMedia propagates back
+        assert result is not None
+        assert result.path == "/tmp/cache/report.docx"
+        assert result.media_type.startswith("application/vnd.openxmlformats-officedocument")
+
+    @pytest.mark.asyncio
+    async def test_passes_through_sfs_mime_hint(self, adapter_and_mod):
+        """SFS stanza's <file media-type="…"> hint should be forwarded."""
+        _adapter, adapter_inst = adapter_and_mod
+
+        seen = {}
+        def fake_cache(data, *, filename="", mime_type="", default_kind=None):
+            seen["mime_type"] = mime_type
+            m = MagicMock()
+            m.path = "/tmp/x"
+            m.media_type = mime_type or "application/octet-stream"
+            m.kind = "document"
+            m.display_name = filename
+            return m
+
+        with patch.object(_adapter, "cache_media_bytes", fake_cache), \
+             self._mock_httpx_with_data(_adapter, b"%PDF-1.4"):
+            await adapter_inst._download_and_cache_media(
+                "https://x/paper.pdf", mime_hint="application/pdf"
+            )
+
+        assert seen["mime_type"] == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_download_failure_returns_none(self, adapter_and_mod):
+        _adapter, adapter_inst = adapter_and_mod
+
+        class _FailingAC:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, *a, **kw):
+                raise RuntimeError("network down")
+
+        with patch.object(_adapter.httpx, "AsyncClient", _FailingAC):
+            result = await adapter_inst._download_and_cache_media("https://x/y.pdf")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_url_without_filename_uses_default(self, adapter_and_mod):
+        """URL with no path component (or just '/') → filename='file'."""
+        _adapter, adapter_inst = adapter_and_mod
+
+        seen = {}
+        def fake_cache(data, *, filename="", mime_type="", default_kind=None):
+            seen["filename"] = filename
+            m = MagicMock()
+            m.path = "/tmp/x"
+            m.media_type = "application/octet-stream"
+            m.kind = "document"
+            m.display_name = filename
+            return m
+
+        with patch.object(_adapter, "cache_media_bytes", fake_cache), \
+             self._mock_httpx_with_data(_adapter, b"\x00\x01"):
+            await adapter_inst._download_and_cache_media("https://x.example.org/")
+
+        # Trailing slash → empty basename → "file"
+        assert seen["filename"] == "file"
+
+
+# ==========================================================================
 # 10. XEP-0050 Ad-Hoc Commands
 # ==========================================================================
 
@@ -995,7 +1343,7 @@ class TestAdhocCommands:
         adapter_inst._registered_plugins.add("xep_0004")
         adapter_inst.allow_all_users = False
         adapter_inst.allowed_users = {"trusted@example.org"}
-        adapter_inst._authorized_users = {"trusted@example.org"}
+        adapter_inst._is_paired = lambda jid: False
 
         iq = MagicMock()
         iq.get_from.return_value = "stranger@evil.example.org/resource"
@@ -1003,6 +1351,28 @@ class TestAdhocCommands:
         session = await adapter_inst._adhoc_hermes_handler(iq, {})
         assert session["notes"][0][0] == "error"
         assert "Access denied" in session["notes"][0][1]
+
+    @pytest.mark.asyncio
+    async def test_stage1_access_granted_for_paired_user(self, adapter_inst):
+        """Paired user (via gateway pairing) passes access control."""
+        mock_form = MagicMock()
+        client = MagicMock()
+        client.__getitem__ = lambda s, k: (
+            MagicMock(make_form=MagicMock(return_value=mock_form))
+            if k == "xep_0004" else MagicMock()
+        )
+        adapter_inst.client = client
+        adapter_inst._registered_plugins.add("xep_0004")
+        adapter_inst.allow_all_users = False
+        adapter_inst.allowed_users = set()
+        adapter_inst._is_paired = lambda jid: jid == "paired@example.org"
+
+        iq = MagicMock()
+        iq.get_from.return_value = "paired@example.org/resource"
+
+        session = await adapter_inst._adhoc_hermes_handler(iq, {})
+        assert session["payload"] == mock_form
+        assert "Access denied" not in str(session.get("notes", ""))
 
     @pytest.mark.asyncio
     async def test_stage1_access_granted_for_authorized(self, adapter_inst):
