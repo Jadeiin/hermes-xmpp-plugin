@@ -317,6 +317,7 @@ class XmppAdapter(BasePlatformAdapter):
     """slixmpp-backed adapter satisfying BasePlatformAdapter."""
 
     MAX_MESSAGE_LENGTH = 4000
+    splits_long_messages = True
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xmpp"))
@@ -384,6 +385,7 @@ class XmppAdapter(BasePlatformAdapter):
         # Reaction-based dangerous command approvals (cf. Matrix send_exec_approval)
         self._approval_reaction_map = {
             "✅": "once",
+            "🔁": "session",
             "❎": "deny",
         }
         self._approval_prompts_by_event: Dict[str, dict] = {}
@@ -2004,6 +2006,7 @@ class XmppAdapter(BasePlatformAdapter):
             "or `/deny` to cancel.\n\n"
             "You can also tap the reaction to approve:\n"
             "✅ = /approve\n"
+            "🔁 = /approve session\n"
             "❎ = /deny"
         )
 
@@ -2035,12 +2038,12 @@ class XmppAdapter(BasePlatformAdapter):
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"
             msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
             self.client["xep_0444"].set_reactions(
-                msg, result.message_id, ["✅", "❎"]
+                msg, result.message_id, ["✅", "🔁", "❎"]
             )
             msg.enable("store")
             msg.send()
             logger.info(
-                "xmpp: sent approval reactions [✅, ❎] on msg %s in %s",
+                "xmpp: sent approval reactions [✅, 🔁, ❎] on msg %s in %s",
                 result.message_id, chat_id,
             )
         except Exception as exc:
