@@ -394,20 +394,44 @@ class XmppAdapter(BasePlatformAdapter):
         self._clarify_prompt_by_session: Dict[str, str] = {}
 
         # MAM (XEP-0313) state — in-memory only (aligns with Telegram's
-        # drop_pending_updates pattern; survives Phase 1 reconnect but
-        # intentionally resets on Phase 2 gateway watcher restart).
+        # drop_pending_updates pattern; survives Phase 1 reconnect and,
+        # since the is_reconnect API (#46621), also replays on Phase 2
+        # gateway watcher restart when the gateway passes is_reconnect=True).
         self._mam_enabled: bool = False
         self._mam_replaying: bool = False
         self._mam_last_dm: Optional[datetime] = None
         self._mam_last_rooms: Dict[str, datetime] = {}
+        # Set when connect(is_reconnect=True) — signals _on_session_start
+        # to trigger MAM catch-up even though this is a fresh adapter instance.
+        self._is_gateway_reconnect: bool = False
 
     # -----------------------------------------------------------------
     # Lifecycle
     # -----------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Reset reconnection state for a fresh connection attempt
         self._reconnecting = False
+
+        # When the gateway watcher is reconnecting after an outage
+        # (Phase 2, is_reconnect=True), seed MAM timestamps to a recent
+        # cutoff so _on_session_start can replay missed messages via
+        # server-side MAM archive (#46621).  Without this, a fresh
+        # adapter instance has no MAM history and silently drops
+        # downtime messages.
+        if is_reconnect:
+            self._is_gateway_reconnect = True
+            if self._mam_enabled:
+                from datetime import timedelta
+                recent = datetime.now(timezone.utc) - timedelta(minutes=10)
+                if self._mam_last_dm is None:
+                    self._mam_last_dm = recent
+                logger.info(
+                    "xmpp: gateway reconnect — MAM replay seeded (since %s)",
+                    recent.isoformat(),
+                )
+        else:
+            self._is_gateway_reconnect = False
 
         client = ClientXMPP(self.jid, self._password)
         # Plugins - core
@@ -616,6 +640,7 @@ class XmppAdapter(BasePlatformAdapter):
             return
 
         was_reconnecting = self._reconnecting
+        should_mam_replay = was_reconnecting or self._is_gateway_reconnect
 
         # Handle successful reconnection
         if self._reconnecting:
@@ -645,7 +670,10 @@ class XmppAdapter(BasePlatformAdapter):
         # Fires as a background task to avoid blocking session startup.
         # SM resume (XEP-0198) may have already replayed some messages — the
         # timestamp-based dedup ensures no duplicates.
-        if self._mam_enabled and was_reconnecting:
+        # Triggered on Phase 1 reconnect (was_reconnecting) or Phase 2
+        # gateway reconnect (is_reconnect=True → _is_gateway_reconnect).
+        if self._mam_enabled and should_mam_replay:
+            self._is_gateway_reconnect = False
             asyncio.create_task(self._mam_catch_up())
 
     def _on_disconnected(self, _event: Any) -> None:
@@ -1218,7 +1246,10 @@ class XmppAdapter(BasePlatformAdapter):
     #
     # State is intentionally ephemeral — aligns with Telegram's
     # drop_pending_updates pattern. Timestamps survive Phase-1 reconnect
-    # (same adapter instance) but reset on Phase-2 gateway watcher restart.
+    # (same adapter instance). On Phase-2 gateway watcher restart
+    # (is_reconnect=True), timestamps are seeded to a recent cutoff so
+    # MAM catch-up replays downtime messages without replaying days of
+    # history (#46621).
     # -----------------------------------------------------------------
 
     def _mam_update_timestamp(self, chat_type: str, chat_id: str) -> None:
