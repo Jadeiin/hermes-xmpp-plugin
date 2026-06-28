@@ -694,6 +694,13 @@ class XmppAdapter(BasePlatformAdapter):
         if self._reconnecting:
             # Reconnect already in progress — slixmpp's reconnect() calls
             # disconnect() internally, which fires this event again.
+            # Still emit a warning so this isn't silently undetectable
+            # when a second disconnect happens during an SM-resumed session
+            # where _reconnecting was never reset (issue #46621).
+            logger.warning(
+                "xmpp: disconnect event received while reconnecting — "
+                "reconnect loop already active, discarding duplicate event"
+            )
             return
         if self.client is None:
             # Stale event after client cleanup — nothing to reconnect.
@@ -727,7 +734,12 @@ class XmppAdapter(BasePlatformAdapter):
 
     def _on_sm_resumed(self, _event: Any) -> None:
         """Session resumed after reconnect — unacked stanzas replayed."""
-        logger.info("xmpp: SM session resumed — unacked stanzas replayed")
+        if self._reconnecting:
+            self._reconnecting = False
+            self._mark_connected()
+            logger.info("xmpp: SM session resumed — unacked stanzas replayed")
+        else:
+            logger.info("xmpp: SM session resumed — unacked stanzas replayed")
 
     def _on_sm_failed(self, _event: Any) -> None:
         """SM enable/resume failed — server may not support it."""
