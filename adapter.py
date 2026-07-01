@@ -368,7 +368,8 @@ class XmppAdapter(BasePlatformAdapter):
         self._omemo_initialized_occurred = False
 
         # Reconnection state
-        self._reconnecting: bool = False
+        self._reconnecting: bool = False        # true until session_start/SM resume
+        self._in_on_disconnected: bool = False  # re-entrancy guard (call-stack only)
 
         # Lazy state
         self.client: Optional[Any] = None
@@ -690,35 +691,61 @@ class XmppAdapter(BasePlatformAdapter):
 
         Making it synchronous guarantees _reconnecting is set before
         _run_process resumes.
+
+        _in_on_disconnected: re-entrancy guard — set only during this
+        call to prevent infinite recursion when reconnect() calls
+        disconnect() internally (which fires this event synchronously).
+        This is the ONLY purpose of this flag; genuine new disconnects
+        are NOT blocked (unlike the old _reconnecting guard which
+        prevented recovery from server flap during session negotiation).
+
+        _reconnecting: lifecycle marker — remains True from the first
+        disconnect until session_start or SM resume fires, so
+        _run_process knows to restart itself rather than signalling
+        the gateway watcher.
         """
-        if self._reconnecting:
-            # Reconnect already in progress — slixmpp's reconnect() calls
-            # disconnect() internally, which fires this event again.
-            # Still emit a warning so this isn't silently undetectable
-            # when a second disconnect happens during an SM-resumed session
-            # where _reconnecting was never reset (issue #46621).
-            logger.warning(
-                "xmpp: disconnect event received while reconnecting — "
-                "reconnect loop already active, discarding duplicate event"
+        if self._in_on_disconnected:
+            # Re-entrant call from reconnect()'s internal disconnect() —
+            # prevent infinite recursion.
+            logger.debug(
+                "xmpp: re-entrant disconnect event from reconnect's internal "
+                "disconnect — ignoring"
             )
             return
         if self.client is None:
             # Stale event after client cleanup — nothing to reconnect.
             return
-        logger.warning(
-            "xmpp: unexpected disconnect — attempting slixmpp reconnect (SM resume if XEP-0198 active)"
-        )
+        if self._reconnecting:
+            # We were already reconnecting, but this is a fresh disconnect
+            # (not re-entrant). This happens when the server flaps: TCP
+            # connects briefly then drops before session_start fires.
+            # Restart the reconnect — old _connect_loop will be cancelled
+            # by connect()'s cancel_connection_attempt().
+            logger.info(
+                "xmpp: fresh disconnect during active reconnect — "
+                "restarting reconnect loop"
+            )
+        else:
+            logger.warning(
+                "xmpp: unexpected disconnect — attempting slixmpp reconnect "
+                "(SM resume if XEP-0198 active)"
+            )
         self._reconnecting = True
+        self._in_on_disconnected = True
         try:
             self.client.reconnect(wait=0.0, reason="Network unreachable")
         except Exception:
-            logger.exception("xmpp: reconnect() call failed, falling back to gateway watcher")
+            logger.exception(
+                "xmpp: reconnect() call failed, falling back to gateway watcher"
+            )
             self._reconnecting = False
             self._set_fatal_error(
                 "xmpp_disconnected",
                 "XMPP connection lost — will retry via gateway",
                 retryable=True,
             )
+        finally:
+            self._in_on_disconnected = False
 
     async def _on_failed_auth(self, _event: Any) -> None:
         self._set_fatal_error(

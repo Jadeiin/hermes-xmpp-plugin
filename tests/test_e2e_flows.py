@@ -577,8 +577,24 @@ class TestReconnection:
         adapter_instance.client.reconnect.assert_called_once()
 
     def test_on_disconnected_noop_when_already_reconnecting(self, adapter_instance):
-        """Re-entry prevention: if _reconnecting is already True, do nothing."""
+        """Fresh disconnect during active reconnect restarts the loop.
+
+        When _reconnecting=True but _in_on_disconnected=False,
+        this is a genuine new disconnect (server flap), not a re-entrant
+        call from reconnect()'s internal disconnect(). The handler
+        should restart the reconnect loop, not discard the event.
+        """
         adapter_instance._reconnecting = True
+        adapter_instance._in_on_disconnected = False
+        adapter_instance.client.reconnect = MagicMock()
+        adapter_instance._on_disconnected(None)
+        adapter_instance.client.reconnect.assert_called_once_with(
+            wait=0.0, reason="Network unreachable"
+        )
+
+    def test_on_disconnected_noop_when_in_on_disconnected(self, adapter_instance):
+        """Re-entrancy guard: _in_on_disconnected=True blocks recursion."""
+        adapter_instance._in_on_disconnected = True
         adapter_instance.client.reconnect = MagicMock()
         adapter_instance._on_disconnected(None)
         adapter_instance.client.reconnect.assert_not_called()
