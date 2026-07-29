@@ -2025,29 +2025,39 @@ class XmppAdapter(BasePlatformAdapter):
         session_key: str,
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         """Send a reaction-based exec approval prompt for XMPP.
-        
-        Posts a warning message with ✅/❎ reactions. When the user
+
+        Posts a warning message with ✅/🔁/❎ reactions. When the user
         clicks a reaction, the inbound reaction handler resolves
         the pending gateway approval.
         """
         if not self.client or "xep_0444" not in self._registered_plugins:
             return SendResult(success=False, error="Not connected or reactions unavailable")
 
+        if smart_denied:
+            description += " (owner override: this operation only)"
+
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
-        text = (
-            "⚠️ **Dangerous command requires approval**\n"
-            f"```\n{cmd_preview}\n```\n"
-            f"Reason: {description}\n\n"
+        text_lines = [
+            "⚠️ **Dangerous command requires approval**",
+            f"```\n{cmd_preview}\n```",
+            f"Reason: {description}",
+            "",
             "Reply `/approve` to execute, `/approve session` to approve this "
             "pattern for the session, `/approve always` to approve permanently, "
-            "or `/deny` to cancel.\n\n"
-            "You can also tap the reaction to approve:\n"
-            "✅ = /approve\n"
-            "🔁 = /approve session\n"
-            "❎ = /deny"
-        )
+            "or `/deny` to cancel.",
+            "",
+            "You can also tap the reaction to approve:",
+            "✅ = /approve",
+        ]
+        if allow_session:
+            text_lines.append("🔁 = /approve session")
+        text_lines.append("❎ = /deny")
+        text = "\n".join(text_lines)
 
         result = await self.send(chat_id, text, metadata=metadata)
         if not result.success or not result.message_id:
@@ -2071,19 +2081,22 @@ class XmppAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
-        # Send BOTH reactions in ONE message — set_reactions REPLACES,
-        # not appends.  Sending separately would leave only the last one.
+        # Build reaction set — set_reactions REPLACES, not appends.
+        approval_reactions = ["✅"]
+        if allow_session:
+            approval_reactions.append("🔁")
+        approval_reactions.append("❎")
         try:
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"
             msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
             self.client["xep_0444"].set_reactions(
-                msg, result.message_id, ["✅", "🔁", "❎"]
+                msg, result.message_id, approval_reactions
             )
             msg.enable("store")
             msg.send()
             logger.info(
-                "xmpp: sent approval reactions [✅, 🔁, ❎] on msg %s in %s",
-                result.message_id, chat_id,
+                "xmpp: sent approval reactions %s on msg %s in %s",
+                approval_reactions, result.message_id, chat_id,
             )
         except Exception as exc:
             logger.warning(
