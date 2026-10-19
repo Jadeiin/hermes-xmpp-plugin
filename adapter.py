@@ -295,9 +295,11 @@ class _MucRoom:
     nick: Optional[str] = None
 
 
-def _parse_muc_rooms(value: str, default_nick: Optional[str]) -> List[_MucRoom]:
+def _parse_muc_rooms(value: Any, default_nick: Optional[str]) -> List[_MucRoom]:
+    # ``muc_rooms`` arrives either as a YAML list (config.yaml) or as the
+    # XMPP_MUC_ROOMS CSV string; normalize both before splitting.
     rooms: List[_MucRoom] = []
-    for entry in (value or "").split(","):
+    for entry in _csv(value).split(","):
         entry = entry.strip()
         if not entry:
             continue
@@ -329,13 +331,13 @@ class XmppAdapter(BasePlatformAdapter):
         self.port: int = int(extra.get("port") or os.getenv("XMPP_PORT", 5222))
         self.muc_nick: str = extra.get("muc_nick") or os.getenv("XMPP_MUC_NICK") or self._default_nick()
         self.muc_rooms: List[_MucRoom] = _parse_muc_rooms(
-            str(extra.get("muc_rooms") or os.getenv("XMPP_MUC_ROOMS", "")), self.muc_nick
+            extra.get("muc_rooms") or os.getenv("XMPP_MUC_ROOMS", ""), self.muc_nick
         )
 
         # Allow-list
         allow_all_raw = str(extra.get("allow_all_users", os.getenv("XMPP_ALLOW_ALL_USERS", "")))
         self.allow_all_users: bool = allow_all_raw.strip().lower() in ("1", "true", "yes")
-        allowed_env = str(extra.get("allowed_users") or os.getenv("XMPP_ALLOWED_USERS", "")).strip()
+        allowed_env = _csv(extra.get("allowed_users") or os.getenv("XMPP_ALLOWED_USERS", ""))
         self.allowed_users = {j.strip() for j in allowed_env.split(",") if j.strip()}
 
         # MUC mention gating — when true, only @mentioned groupchat
