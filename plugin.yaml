@@ -8,6 +8,8 @@ description: >
   data forms, ad-hoc commands, message markup, voice messages, mandatory
   STARTTLS, and XEP-0363 HTTP file upload.
 author: Samuel Proulx / fastfinge, based on work by Eric Lars Lee and Mibay
+# Python dependencies live in pyproject.toml (PM reads it first and it wins
+# over manifest lists). Keep them out of this file so there is one source.
 requires_env:
   - name: XMPP_JID
     description: Bot JID, for example hermes@example.org

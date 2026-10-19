@@ -53,12 +53,12 @@ From the Hermes profile you want to use:
 ```bash
 cd ~/.hermes/plugins
 git clone https://github.com/fastfinge/hermes-xmpp-plugin.git
-uv pip install --python ~/.hermes/hermes-agent/venv/bin/python -r ~/.hermes/plugins/hermes-xmpp-plugin/requirements.txt
-hermes config set plugins.enabled '["hermes-xmpp-plugin"]'
+hermes plugins enable hermes-xmpp-plugin
 ```
 
-If you run Hermes from a different checkout/venv, install requirements into that
-Python environment instead.
+Python dependencies are declared in `pyproject.toml`; Hermes PM installs them into
+the active environment generation when the plugin is enabled and on every
+`hermes update`. Do not `pip install -r` anything by hand.
 
 Restart the gateway after installing or changing env vars:
 
@@ -123,15 +123,10 @@ xmpp:
 
 Env vars win when both are set.
 
-## OMEMO end-to-end encryption (optional)
+## OMEMO end-to-end encryption
 
-Install the extra dependencies:
-
-```bash
-uv pip install --python ~/.hermes/hermes-agent/venv/bin/python slixmpp-omemo omemo
-```
-
-Then set in `~/.hermes/.env`:
+OMEMO support (`slixmpp-omemo`) is a declared dependency, so it is installed
+with the plugin. Just enable it in `~/.hermes/.env`:
 
 ```env
 XMPP_OMEMO_ENABLED=true

@@ -1,0 +1,19 @@
+[project]
+name = "hermes-xmpp-plugin"
+version = "0.3.0"
+description = "Third-party XMPP/Jabber gateway platform plugin for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Samuel Proulx / fastfinge" }]
+dependencies = [
+    "slixmpp==1.17.0",
+    "slixmpp-omemo==2.2.0",
+]
+
+# Deliberately no [build-system]: this is a directory plugin loaded from
+# plugin.yaml, not a distribution. Hermes PM treats a build-system-less
+# member as virtual (metadata-only) and installs `dependencies` into the
+# shared environment generation on every install/update.
+#
+# Do not add aiohttp here: Hermes core pins it at the CVE floor and only
+# slixmpp's optional XEP-0363 extra needs it.

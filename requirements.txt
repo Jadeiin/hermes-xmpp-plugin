@@ -1,6 +1,0 @@
-slixmpp==1.15.0
-aiohttp==3.13.4
-
-# Optional — for OMEMO end-to-end encryption
-# slixmpp-omemo
-# omemo
