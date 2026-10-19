@@ -68,6 +68,38 @@ from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
 logger = logging.getLogger(__name__)
 
 
+def _scoped_env(name: str, default: str = "") -> str:
+    """Read an ``XMPP_*`` setting through Hermes' active profile scope.
+
+    A multiplexed gateway runs every profile inside one process, so a plain
+    ``os.getenv`` hands all of them the same value. ``get_env_value`` resolves
+    against the profile's own ``.env`` while a profile scope is bound (adapter
+    construction happens inside one) and falls back to the ambient environment
+    for standalone use and tests.
+    """
+    try:
+        from hermes_cli.config import get_env_value  # type: ignore[import-not-found]
+    except Exception:
+        return os.getenv(name, default)
+    try:
+        value = get_env_value(name)
+    except Exception:
+        value = None
+    return str(value) if value else os.getenv(name, default)
+
+
+def _hermes_home() -> str:
+    """Profile-scoped Hermes home; the env var is process-global under multiplex."""
+    try:
+        from hermes_cli.config import get_hermes_home  # type: ignore[import-not-found]
+    except Exception:
+        return os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    try:
+        return str(get_hermes_home())
+    except Exception:
+        return os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes"))
+
+
 # ----------------------------------------------------------------
 # AES-GCM URL pattern (XEP-0454 OMEMO Media Sharing)
 # Format: aesgcm://<host>/<path>#<IV(24 hex)><key(64 hex)>
@@ -325,33 +357,33 @@ class XmppAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("xmpp"))
         extra = config.extra or {}
 
-        self.jid: str = str(extra.get("jid") or os.getenv("XMPP_JID", ""))
-        self._password: str = str(extra.get("password") or os.getenv("XMPP_PASSWORD", ""))
-        self.host: Optional[str] = extra.get("host") or os.getenv("XMPP_HOST") or None
-        self.port: int = int(extra.get("port") or os.getenv("XMPP_PORT", 5222))
-        self.muc_nick: str = extra.get("muc_nick") or os.getenv("XMPP_MUC_NICK") or self._default_nick()
+        self.jid: str = str(extra.get("jid") or _scoped_env("XMPP_JID", ""))
+        self._password: str = str(extra.get("password") or _scoped_env("XMPP_PASSWORD", ""))
+        self.host: Optional[str] = extra.get("host") or _scoped_env("XMPP_HOST") or None
+        self.port: int = int(extra.get("port") or _scoped_env("XMPP_PORT", "5222"))
+        self.muc_nick: str = extra.get("muc_nick") or _scoped_env("XMPP_MUC_NICK") or self._default_nick()
         self.muc_rooms: List[_MucRoom] = _parse_muc_rooms(
-            extra.get("muc_rooms") or os.getenv("XMPP_MUC_ROOMS", ""), self.muc_nick
+            extra.get("muc_rooms") or _scoped_env("XMPP_MUC_ROOMS", ""), self.muc_nick
         )
 
         # Allow-list
-        allow_all_raw = str(extra.get("allow_all_users", os.getenv("XMPP_ALLOW_ALL_USERS", "")))
+        allow_all_raw = str(extra.get("allow_all_users", _scoped_env("XMPP_ALLOW_ALL_USERS", "")))
         self.allow_all_users: bool = allow_all_raw.strip().lower() in ("1", "true", "yes")
-        allowed_env = _csv(extra.get("allowed_users") or os.getenv("XMPP_ALLOWED_USERS", ""))
+        allowed_env = _csv(extra.get("allowed_users") or _scoped_env("XMPP_ALLOWED_USERS", ""))
         self.allowed_users = {j.strip() for j in allowed_env.split(",") if j.strip()}
 
         # MUC mention gating — when true, only @mentioned groupchat
         # messages trigger replies.  Aligns with Telegram / Feishu /
         # WhatsApp / BlueBubbles require_mention.  Default: true.
-        _rm_raw = str(extra.get("require_mention") or os.getenv("XMPP_REQUIRE_MENTION", "true"))
+        _rm_raw = str(extra.get("require_mention") or _scoped_env("XMPP_REQUIRE_MENTION", "true"))
         self._muc_require_mention: bool = _rm_raw.strip().lower() in ("1", "true", "yes")
 
         # XEP-0394 / XEP-0071 rich markup (default: disabled to keep
         # message size small).  Enable explicitly in config.yaml extra
         # or via env vars.
-        _mk_raw = str(extra.get("xep_0394_enabled") or os.getenv("XMPP_XEP_0394_ENABLED", "false"))
+        _mk_raw = str(extra.get("xep_0394_enabled") or _scoped_env("XMPP_XEP_0394_ENABLED", "false"))
         self._xep_0394_enabled: bool = _mk_raw.strip().lower() in ("1", "true", "yes")
-        _html_raw = str(extra.get("xep_0071_enabled") or os.getenv("XMPP_XEP_0071_ENABLED", "false"))
+        _html_raw = str(extra.get("xep_0071_enabled") or _scoped_env("XMPP_XEP_0071_ENABLED", "false"))
         self._xep_0071_enabled: bool = _html_raw.strip().lower() in ("1", "true", "yes")
 
         # OMEMO
@@ -359,13 +391,13 @@ class XmppAdapter(BasePlatformAdapter):
         self._omemo_enabled: bool = bool(
             omemo_cfg.get("enabled")
             if isinstance(omemo_cfg, dict) and "enabled" in omemo_cfg
-            else extra.get("omemo_enabled", os.getenv("XMPP_OMEMO_ENABLED", "true"))
+            else extra.get("omemo_enabled", _scoped_env("XMPP_OMEMO_ENABLED", "true"))
         )
         self._omemo_storage_path: str = str(
             (omemo_cfg.get("storage_path") if isinstance(omemo_cfg, dict) else None)
             or extra.get("omemo_storage_path")
-            or os.getenv("XMPP_OMEMO_STORAGE_PATH", "")
-        ) or str(Path(os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "xmpp_omemo.json")
+            or _scoped_env("XMPP_OMEMO_STORAGE_PATH", "")
+        ) or str(Path(_hermes_home()) / "xmpp_omemo.json")
         self._omemo_initialized = asyncio.Event()
         self._omemo_initialized_occurred = False
 
