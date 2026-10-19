@@ -68,24 +68,51 @@ from gateway.platforms.base import (  # pyright: ignore[reportMissingImports]
 logger = logging.getLogger(__name__)
 
 
+_ENV_FILE_CACHE: dict[tuple[str, float], dict[str, str]] = {}
+
+
+def _read_dotenv(path: Path) -> dict[str, str]:
+    """Parse a Hermes ``.env`` the way the config layer does, minus expansion."""
+    try:
+        stamp = (str(path), path.stat().st_mtime)
+    except OSError:
+        return {}
+    cached = _ENV_FILE_CACHE.get(stamp)
+    if cached is not None:
+        return cached
+    values: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, _, raw = line.partition("=")
+        key = key.strip()
+        value = raw.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        values[key] = value
+    _ENV_FILE_CACHE.clear()
+    _ENV_FILE_CACHE[stamp] = values
+    return values
+
+
 def _scoped_env(name: str, default: str = "") -> str:
-    """Read an ``XMPP_*`` setting through Hermes' active profile scope.
+    """Read an ``XMPP_*`` setting from the bound profile's own ``.env``.
 
     A multiplexed gateway runs every profile inside one process, so a plain
-    ``os.getenv`` hands all of them the same value. ``get_env_value`` resolves
-    against the profile's own ``.env`` while a profile scope is bound (adapter
-    construction happens inside one) and falls back to the ambient environment
-    for standalone use and tests.
+    ``os.getenv`` hands all of them the same value (and the process-wide env is
+    the default profile's). The profile home is the only reliable discriminator
+    at adapter-construction time, so read that profile's ``.env`` directly and
+    fall back to the ambient environment for standalone use and tests.
     """
-    try:
-        from hermes_cli.config import get_env_value  # type: ignore[import-not-found]
-    except Exception:
-        return os.getenv(name, default)
-    try:
-        value = get_env_value(name)
-    except Exception:
-        value = None
-    return str(value) if value else os.getenv(name, default)
+    value = _read_dotenv(Path(_hermes_home()) / ".env").get(name)
+    return value if value else os.getenv(name, default)
 
 
 def _hermes_home() -> str:
