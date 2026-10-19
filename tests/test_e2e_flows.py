@@ -218,6 +218,7 @@ def adapter_instance():
     client.boundjid.bare = "hermes@example.org"
     client.plugins = {}
     client.__getitem__ = lambda s, k: client.plugins.get(k)
+    client.plugin = client
     client.__contains__ = lambda s, k: k in client.plugins
     client.make_message = MagicMock(return_value=MagicMock())
     client.send_message = MagicMock(return_value=MagicMock())

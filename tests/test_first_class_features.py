@@ -178,6 +178,7 @@ def fake_client():
         return key in self.plugins
 
     client.__getitem__ = _plugin_item
+    client.plugin = client
     client.__contains__ = _in
 
     client.make_message = MagicMock(return_value=MagicMock())

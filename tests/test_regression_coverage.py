@@ -211,6 +211,7 @@ class TestMessageTruncation:
 
         # xep_0461 is not needed if reply_to is None
         client.__getitem__ = MagicMock(return_value=MagicMock())
+        client.plugin = client
         client.__contains__ = MagicMock(return_value=True)
 
         adapter_inst.client = client
@@ -263,6 +264,7 @@ class TestMucSelfMessageFilter:
         xep0045 = MagicMock()
         xep0045.get_jid_property.return_value = "hermes@example.org"
         fake_client.__getitem__ = lambda s, k: xep0045 if k == "xep_0045" else MagicMock()
+        fake_client.plugin = fake_client
         fake_client.__contains__ = lambda s, k: k == "xep_0045"
         adapter_inst.client = fake_client
         adapter_inst._registered_plugins.add("xep_0045")
@@ -399,6 +401,7 @@ class TestChatMarkers:
         client.boundjid.bare = "hermes@example.org"
         xep0333 = MagicMock()
         client.__getitem__ = lambda s, k: xep0333 if k == "xep_0333" else MagicMock()
+        client.plugin = client
         client.__contains__ = lambda s, k: k == "xep_0333"
         adapter_inst.client = client
         adapter_inst._registered_plugins.add("xep_0333")
@@ -579,6 +582,7 @@ class TestOmemoMediaSharing:
         xep0363 = MagicMock()
         xep0363.upload_file = AsyncMock(return_value="https://upload.example.org/file.jpg")
         adapter_inst.client.__getitem__ = lambda s, k: xep0363 if k == "xep_0363" else MagicMock()
+        adapter_inst.client.plugin = adapter_inst.client
         adapter_inst.client.__contains__ = MagicMock(return_value=True)
         adapter_inst.client.send_message = MagicMock(return_value=MagicMock())
 
@@ -612,6 +616,7 @@ class TestOmemoMediaSharing:
             "xep_0454": xep0454,
             "xep_0363": MagicMock(),
         }.get(k, MagicMock())
+        adapter_inst.client.plugin = adapter_inst.client
         adapter_inst.client.__contains__ = MagicMock(return_value=True)
 
         # Mock self.send to capture the call
@@ -962,6 +967,7 @@ class TestAesgcmCacheRouting:
         xep_0454.decrypt = MagicMock(return_value=plaintext)
         inst.client = MagicMock()
         inst.client.__getitem__ = lambda s, k: xep_0454 if k == "xep_0454" else MagicMock()
+        inst.client.plugin = inst.client
 
     def _fake_cached_media(self, path, media_type, kind="document", display="file"):
         """Build a CachedMedia-shaped MagicMock."""
@@ -1033,6 +1039,7 @@ class TestAesgcmCacheRouting:
             adapter_inst.client.__getitem__ = lambda s, k: MagicMock(
                 decrypt=MagicMock(return_value=plaintext)
             ) if k == "xep_0454" else MagicMock()
+            adapter_inst.client.plugin = adapter_inst.client
             cached, mime = await adapter_inst._decrypt_aesgcm(aesgcm)
 
         # The mime returned by cache_media_bytes is what we hand back
@@ -1055,6 +1062,7 @@ class TestAesgcmCacheRouting:
             adapter_inst.client.__getitem__ = lambda s, k: MagicMock(
                 decrypt=MagicMock(return_value=plaintext)
             ) if k == "xep_0454" else MagicMock()
+            adapter_inst.client.plugin = adapter_inst.client
             cached, mime = await adapter_inst._decrypt_aesgcm(aesgcm)
 
         assert cached is None
@@ -1098,6 +1106,7 @@ class TestAesgcmCacheRouting:
             adapter_inst.client.__getitem__ = lambda s, k: MagicMock(
                 decrypt=MagicMock(return_value=plaintext)
             ) if k == "xep_0454" else MagicMock()
+            adapter_inst.client.plugin = adapter_inst.client
             cached, mime = await adapter_inst._decrypt_aesgcm(aesgcm)
 
         assert cached is None
@@ -1265,6 +1274,7 @@ class TestAdhocCommands:
         client.boundjid.bare = "hermes@example.org"
         xep0050 = MagicMock()
         client.__getitem__ = lambda s, k: xep0050 if k == "xep_0050" else MagicMock()
+        client.plugin = client
         adapter_inst.client = client
         adapter_inst._registered_plugins.add("xep_0050")
 
@@ -1295,6 +1305,7 @@ class TestAdhocCommands:
         xep0050 = MagicMock()
         xep0050.add_command.side_effect = RuntimeError("boom")
         client.__getitem__ = lambda s, k: xep0050 if k == "xep_0050" else MagicMock()
+        client.plugin = client
         adapter_inst.client = client
         adapter_inst._registered_plugins.add("xep_0050")
 
@@ -1312,6 +1323,7 @@ class TestAdhocCommands:
         client.__getitem__ = lambda s, k: MagicMock() if k != "xep_0004" else (
             MagicMock(make_form=MagicMock(return_value=mock_form))
         )
+        client.plugin = client
         adapter_inst.client = client
         adapter_inst._registered_plugins.add("xep_0004")
 
@@ -1339,6 +1351,7 @@ class TestAdhocCommands:
         """Unauthorized JID gets 'Access denied' error."""
         client = MagicMock()
         client.__getitem__ = lambda s, k: MagicMock()
+        client.plugin = client
         adapter_inst.client = client
         adapter_inst._registered_plugins.add("xep_0004")
         adapter_inst.allow_all_users = False
@@ -1361,6 +1374,7 @@ class TestAdhocCommands:
             MagicMock(make_form=MagicMock(return_value=mock_form))
             if k == "xep_0004" else MagicMock()
         )
+        client.plugin = client
         adapter_inst.client = client
         adapter_inst._registered_plugins.add("xep_0004")
         adapter_inst.allow_all_users = False
@@ -1383,6 +1397,7 @@ class TestAdhocCommands:
             MagicMock(make_form=MagicMock(return_value=mock_form))
             if k == "xep_0004" else MagicMock()
         )
+        client.plugin = client
         adapter_inst.client = client
         adapter_inst._registered_plugins.add("xep_0004")
         adapter_inst.allow_all_users = True  # gateway pairing mode

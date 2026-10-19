@@ -469,7 +469,7 @@ class XmppAdapter(BasePlatformAdapter):
         if "xep_0394" in self._registered_plugins:
             try:
                 import contextlib, io, functools
-                xep0394 = client["xep_0394"]
+                xep0394 = client.plugin["xep_0394"]
                 _orig_to_xhtml = xep0394.to_xhtml_im
                 @functools.wraps(_orig_to_xhtml)
                 def _quiet_to_xhtml_im(body, markup):
@@ -841,7 +841,7 @@ class XmppAdapter(BasePlatformAdapter):
             # OMEMO decryption
             if self.client is not None and "xep_0384" in self._registered_plugins and SLIXMPP_OMEMO_AVAILABLE:
                 client_local = self.client  # type: ignore[assignment]
-                xep_0384 = client_local["xep_0384"]
+                xep_0384 = client_local.plugin["xep_0384"]
                 if xep_0384.is_encrypted(stanza):
                     try:
                         decrypted_stanza, device_info = await xep_0384.decrypt_message(stanza)
@@ -1032,7 +1032,7 @@ class XmppAdapter(BasePlatformAdapter):
                 real_jid = None
                 try:
                     if self.client is not None and "xep_0045" in self._registered_plugins:
-                        jid_val = self.client["xep_0045"].get_jid_property(
+                        jid_val = self.client.plugin["xep_0045"].get_jid_property(
                             from_bare, from_resource, "jid"
                         )
                         if jid_val:
@@ -1232,7 +1232,7 @@ class XmppAdapter(BasePlatformAdapter):
             if not self._mam_replaying and msg_id and from_full and "xep_0333" in self._registered_plugins and self.client is not None:
                 try:
                     mtype = "groupchat" if stanza_type == "groupchat" else "chat"
-                    self.client["xep_0333"].send_marker(
+                    self.client.plugin["xep_0333"].send_marker(
                         mto=JID(from_full),
                         id=msg_id,
                         marker="displayed",
@@ -1327,7 +1327,7 @@ class XmppAdapter(BasePlatformAdapter):
             if self._mam_last_dm is not None:
                 try:
                     count = 0
-                    async for mam_msg in self.client["xep_0313"].iterate(
+                    async for mam_msg in self.client.plugin["xep_0313"].iterate(
                         start=self._mam_last_dm,
                         end=cutoff,
                         reverse=False,
@@ -1363,7 +1363,7 @@ class XmppAdapter(BasePlatformAdapter):
                     continue
                 try:
                     count = 0
-                    async for mam_msg in self.client["xep_0313"].iterate(
+                    async for mam_msg in self.client.plugin["xep_0313"].iterate(
                         jid=JID(room_jid),
                         start=last_ts,
                         end=cutoff,
@@ -1500,7 +1500,7 @@ class XmppAdapter(BasePlatformAdapter):
                 # subsequent chunks are standalone but share the thread.
                 chunk_reply_to = reply_to if i == 0 else None
                 if chunk_reply_to and "xep_0461" in self._registered_plugins:
-                    stanza = client_local["xep_0461"].make_reply(
+                    stanza = client_local.plugin["xep_0461"].make_reply(
                         reply_to=JID(chat_id),
                         reply_id=chunk_reply_to,
                         mto=chat_id,
@@ -1527,7 +1527,7 @@ class XmppAdapter(BasePlatformAdapter):
                             # XHTML-IM first (reads from markup['substanzas'])
                             if self._xep_0071_enabled:
                                 try:
-                                    xhtml = client_local["xep_0394"].to_xhtml_im(chunk, markup)
+                                    xhtml = client_local.plugin["xep_0394"].to_xhtml_im(chunk, markup)
                                     if xhtml is not None and getattr(xhtml, "xml", None) is not None:
                                         stanza.xml.append(xhtml.xml)
                                 except Exception:
@@ -1570,7 +1570,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         try:
             client_local = self.client
-            stanza = client_local["xep_0308"].build_correction(
+            stanza = client_local.plugin["xep_0308"].build_correction(
                 id_to_replace=message_id,
                 mto=JID(chat_id),
                 mtype=mtype,
@@ -1586,7 +1586,7 @@ class XmppAdapter(BasePlatformAdapter):
                     markup = self._build_markup(content)
                     if markup is not None:
                         if self._xep_0071_enabled:
-                            xhtml = client_local["xep_0394"].to_xhtml_im(content, markup)
+                            xhtml = client_local.plugin["xep_0394"].to_xhtml_im(content, markup)
                             if xhtml is not None and getattr(xhtml, "xml", None) is not None:
                                 stanza.xml.append(xhtml.xml)
                         if self._xep_0394_enabled:
@@ -1601,7 +1601,7 @@ class XmppAdapter(BasePlatformAdapter):
                 and mtype == "chat"
             ):
                 try:
-                    xep_0384 = client_local["xep_0384"]
+                    xep_0384 = client_local.plugin["xep_0384"]
                     recipient_jid = JID(chat_id)
                     encrypted, errors = await xep_0384.encrypt_message(stanza, {recipient_jid})
                     if errors:
@@ -1620,7 +1620,7 @@ class XmppAdapter(BasePlatformAdapter):
                                 import oldmemo
                                 ns = oldmemo.oldmemo.NAMESPACE
                                 stanza["eme"]["namespace"] = ns
-                                stanza["eme"]["name"] = client_local["xep_0380"].mechanisms[ns]
+                                stanza["eme"]["name"] = client_local.plugin["xep_0380"].mechanisms[ns]
                             except Exception:
                                 pass
                 except Exception as exc:
@@ -1663,7 +1663,7 @@ class XmppAdapter(BasePlatformAdapter):
             return False
 
         try:
-            self.client["xep_0424"].send_retraction(
+            self.client.plugin["xep_0424"].send_retraction(
                 mto=JID(chat_id),
                 id=message_id,
                 mtype=mtype,
@@ -1745,7 +1745,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         chunks = self.truncate_message(content, self.MAX_MESSAGE_LENGTH)
         client_local = self.client  # type: ignore[assignment]
-        xep_0384 = client_local["xep_0384"]
+        xep_0384 = client_local.plugin["xep_0384"]
         mtype = "chat"
         last_msg_id = None
 
@@ -1784,7 +1784,7 @@ class XmppAdapter(BasePlatformAdapter):
                         markup = self._build_markup(chunk)
                         if markup is not None:
                             if self._xep_0071_enabled:
-                                xhtml = client_local["xep_0394"].to_xhtml_im(chunk, markup)
+                                xhtml = client_local.plugin["xep_0394"].to_xhtml_im(chunk, markup)
                                 if xhtml is not None and getattr(xhtml, "xml", None) is not None:
                                     stanza.xml.append(xhtml.xml)
                             if self._xep_0394_enabled:
@@ -1804,7 +1804,7 @@ class XmppAdapter(BasePlatformAdapter):
                     import oldmemo
                     ns = oldmemo.oldmemo.NAMESPACE
                     message["eme"]["namespace"] = ns
-                    message["eme"]["name"] = client_local["xep_0380"].mechanisms[ns]
+                    message["eme"]["name"] = client_local.plugin["xep_0380"].mechanisms[ns]
                 except Exception:
                     pass
 
@@ -2091,7 +2091,7 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"
             msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
-            self.client["xep_0444"].set_reactions(
+            self.client.plugin["xep_0444"].set_reactions(
                 msg, result.message_id, approval_reactions
             )
             msg.enable("store")
@@ -2116,7 +2116,7 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"
             msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
-            self.client["xep_0444"].set_reactions(
+            self.client.plugin["xep_0444"].set_reactions(
                 msg, prompt["message_id"], []
             )
             msg.enable("store")
@@ -2227,7 +2227,7 @@ class XmppAdapter(BasePlatformAdapter):
             return None, None
 
         try:
-            plaintext = self.client["xep_0454"].decrypt(BytesIO(encrypted_data), fragment)
+            plaintext = self.client.plugin["xep_0454"].decrypt(BytesIO(encrypted_data), fragment)
         except Exception as exc:
             logger.warning("xmpp: aesgcm:// decryption failed: %s", exc)
             return None, None
@@ -2276,7 +2276,7 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             if use_omemo_media:
                 # XEP-0454: encrypt file before upload, get aesgcm:// URL
-                url = await self.client["xep_0454"].upload_file(
+                url = await self.client.plugin["xep_0454"].upload_file(
                     filename=Path(path),
                     content_type=content_type,
                 )
@@ -2288,7 +2288,7 @@ class XmppAdapter(BasePlatformAdapter):
                 }
                 if content_type:
                     upload_kwargs["content_type"] = content_type
-                upload = self.client["xep_0363"].upload_file
+                upload = self.client.plugin["xep_0363"].upload_file
                 try:
                     url = await upload(**upload_kwargs)
                 except TypeError:
@@ -2343,7 +2343,7 @@ class XmppAdapter(BasePlatformAdapter):
             return
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         msg = self.client.make_message(mto=chat_id, mtype=mtype)
-        self.client["xep_0444"].set_reactions(msg, target_id, reactions)
+        self.client.plugin["xep_0444"].set_reactions(msg, target_id, reactions)
         msg.enable("store")
         msg.send()
 
@@ -2473,7 +2473,7 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"
             msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
-            self.client["xep_0444"].set_reactions(
+            self.client.plugin["xep_0444"].set_reactions(
                 msg, result.message_id, reaction_emojis
             )
             msg.enable("store")
@@ -2495,7 +2495,7 @@ class XmppAdapter(BasePlatformAdapter):
         try:
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"
             msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
-            self.client["xep_0444"].set_reactions(
+            self.client.plugin["xep_0444"].set_reactions(
                 msg, prompt["message_id"], []
             )
             msg.enable("store")
@@ -2517,7 +2517,7 @@ class XmppAdapter(BasePlatformAdapter):
         if self.client is None or "xep_0050" not in self._registered_plugins:
             return
         try:
-            xep_0050 = self.client["xep_0050"]
+            xep_0050 = self.client.plugin["xep_0050"]
             xep_0050.add_command(
                 jid=self.client.boundjid,
                 node="hermes",
@@ -2553,7 +2553,7 @@ class XmppAdapter(BasePlatformAdapter):
             session["notes"] = [("error", "Data forms not available")]
             return session
         try:
-            form = client["xep_0004"].make_form(
+            form = client.plugin["xep_0004"].make_form(
                 ftype="form",
                 title="Hermes Commands",
                 instructions="Choose a command to execute.",
@@ -2667,7 +2667,7 @@ class XmppAdapter(BasePlatformAdapter):
         if content_type:
             upload_kwargs["content_type"] = content_type
         try:
-            upload = self.client["xep_0363"].upload_file
+            upload = self.client.plugin["xep_0363"].upload_file
             try:
                 url = await upload(**upload_kwargs)
             except TypeError:
@@ -2679,7 +2679,7 @@ class XmppAdapter(BasePlatformAdapter):
 
         mtype = "groupchat" if self._is_muc(chat_id) else "chat"
         try:
-            sfs = self.client["xep_0447"].get_sfs(
+            sfs = self.client.plugin["xep_0447"].get_sfs(
                 path=Path(path),
                 uris=[url],
                 media_type=content_type or "audio/ogg",
