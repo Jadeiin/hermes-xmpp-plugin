@@ -385,6 +385,13 @@ class XmppAdapter(BasePlatformAdapter):
         extra = config.extra or {}
 
         self.jid: str = str(extra.get("jid") or _scoped_env("XMPP_JID", ""))
+        logger.info(
+            "XMPP adapter: identity jid=%s source=%s home=%s env_file=%s",
+            self.jid,
+            "config" if extra.get("jid") else "env",
+            _hermes_home(),
+            (Path(_hermes_home()) / ".env").is_file(),
+        )
         self._password: str = str(extra.get("password") or _scoped_env("XMPP_PASSWORD", ""))
         self.host: Optional[str] = extra.get("host") or _scoped_env("XMPP_HOST") or None
         self.port: int = int(extra.get("port") or _scoped_env("XMPP_PORT", "5222"))
