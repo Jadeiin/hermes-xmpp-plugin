@@ -2858,8 +2858,12 @@ def _csv(value: Any) -> str:
 
 
 def _env_enablement() -> Optional[dict[str, Any]]:
-    jid = os.getenv("XMPP_JID", "").strip()
-    password = os.getenv("XMPP_PASSWORD", "").strip()
+    # Read through the profile scope: a multiplexed gateway runs every profile
+    # in one process, so os.getenv would enable every profile with the default
+    # profile's account (and the platform config then wins over the adapter's
+    # own per-profile resolution).
+    jid = _scoped_env("XMPP_JID", "").strip()
+    password = _scoped_env("XMPP_PASSWORD", "").strip()
     if not (jid and password):
         return None
     data: dict[str, Any] = {"jid": jid, "password": password}
@@ -2873,7 +2877,7 @@ def _env_enablement() -> Optional[dict[str, Any]]:
         ("XMPP_XEP_0394_ENABLED", "xep_0394_enabled"),
         ("XMPP_XEP_0071_ENABLED", "xep_0071_enabled"),
     ):
-        value = os.getenv(env, "").strip()
+        value = _scoped_env(env, "").strip()
         if value:
             data[key] = value
     return data
