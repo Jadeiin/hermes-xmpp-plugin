@@ -934,10 +934,15 @@ class XmppAdapter(BasePlatformAdapter):
                 if xep_0384.is_encrypted(stanza):
                     sender_device = None
                     has_prekey = None
+                    enc_ns = None
                     try:
-                        header = stanza["encrypted"]["header"]
-                        sender_device = header["sid"]
-                        has_prekey = header.get("prekey") is not None
+                        enc_el = stanza.xml.find("{*}encrypted")
+                        if enc_el is not None:
+                            enc_ns = enc_el.tag.split("}")[0].lstrip("{")
+                            header = enc_el.find("{*}header")
+                            if header is not None:
+                                sender_device = header.get("sid")
+                                has_prekey = header.find("{*}prekey") is not None
                     except Exception:
                         pass
                     try:
@@ -950,8 +955,9 @@ class XmppAdapter(BasePlatformAdapter):
                         )
                     except Exception as exc:
                         logger.warning(
-                            "OMEMO: failed to decrypt message from %s (device %s, prekey=%s): %s",
-                            from_bare, sender_device, has_prekey, exc,
+                            "OMEMO: failed to decrypt message from %s (device %s, prekey=%s, ns=%s): %s",
+                            from_bare, sender_device, has_prekey, enc_ns, exc,
+                            exc_info=True,
                         )
                         return
 
