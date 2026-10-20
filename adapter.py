@@ -2183,16 +2183,15 @@ class XmppAdapter(BasePlatformAdapter):
             return await super()._send_exec_approval_prompt(prompt)
 
         emoji_for = {"once": "✅", "session": "🔁", "always": "♾️", "deny": "❎"}
-        lines = [prompt.text, ""]
         choices: list[str] = []
         emoji_map: Dict[str, str] = {}
-        for idx, (label, choice, _style) in enumerate(prompt.actions, start=1):
+        legend: list[str] = []
+        for label, choice, _style in prompt.actions:
             emoji = emoji_for.get(choice, "🔹")
             choices.append(choice)
             emoji_map[emoji] = choice
-            lines.append(f"{idx}. {label}  {emoji}")
-        lines += ["", "回复数字，或点对应表情。"]
-        text = "\n".join(lines)
+            legend.append(f"{emoji} {label}")
+        text = f"{prompt.text}\n\n点表情直接选择：{'   '.join(legend)}"
 
         result = await self.send(prompt.chat_id, text, metadata=prompt.metadata)
         if not result.success or not result.message_id:

@@ -547,8 +547,8 @@ async def test_approval_prompt_renders_numbered_choices(fake_adapter, fake_clien
     result = await fake_adapter._send_exec_approval_prompt(prompt)
 
     assert result.success
-    assert "1. Approve once" in captured["text"]
-    assert "3. Deny" in captured["text"]
+    assert "✅ Approve once" in captured["text"]
+    assert "❎ Deny" in captured["text"]
     entry = fake_adapter._approval_prompts_by_event["m1"]
     assert entry["choices"] == ["once", "session", "deny"]
     assert entry["emoji_map"]["✅"] == "once"
