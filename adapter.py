@@ -932,6 +932,14 @@ class XmppAdapter(BasePlatformAdapter):
                 client_local = self.client  # type: ignore[assignment]
                 xep_0384 = client_local.plugin["xep_0384"]
                 if xep_0384.is_encrypted(stanza):
+                    sender_device = None
+                    has_prekey = None
+                    try:
+                        header = stanza["encrypted"]["header"]
+                        sender_device = header["sid"]
+                        has_prekey = header.get("prekey") is not None
+                    except Exception:
+                        pass
                     try:
                         decrypted_stanza, device_info = await xep_0384.decrypt_message(stanza)
                         body = decrypted_stanza.get("body", "") or ""
@@ -941,7 +949,10 @@ class XmppAdapter(BasePlatformAdapter):
                             from_bare, device_info.device_id
                         )
                     except Exception as exc:
-                        logger.warning("OMEMO: failed to decrypt message from %s: %s", from_bare, exc)
+                        logger.warning(
+                            "OMEMO: failed to decrypt message from %s (device %s, prekey=%s): %s",
+                            from_bare, sender_device, has_prekey, exc,
+                        )
                         return
 
             # ── Inbound aesgcm:// (XEP-0454 OMEMO Media Sharing) ──────
