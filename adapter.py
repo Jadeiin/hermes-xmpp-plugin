@@ -115,6 +115,19 @@ def _scoped_env(name: str, default: str = "") -> str:
     return value if value else os.getenv(name, default)
 
 
+def _log_muc_join(fut, room: str) -> None:
+    """Consume a fire-and-forget MUC join future so a failure stays one log line."""
+    try:
+        if fut.cancelled():
+            return
+        exc = fut.exception()
+    except Exception:
+        logger.debug("xmpp: MUC join future for %s could not be inspected", room, exc_info=True)
+        return
+    if exc is not None:
+        logger.warning("xmpp: failed to join MUC %s: %s", room, exc)
+
+
 def _hermes_home() -> str:
     """Profile-scoped Hermes home; the env var is process-global under multiplex."""
     try:
@@ -726,9 +739,14 @@ class XmppAdapter(BasePlatformAdapter):
             logger.exception("xmpp: get_roster failed")
         for room in self.muc_rooms:
             try:
-                self.client.plugin["xep_0045"].join_muc(room.room, room.nick or self.muc_nick)  # type: ignore[union-attr]
+                fut = self.client.plugin["xep_0045"].join_muc(room.room, room.nick or self.muc_nick)  # type: ignore[union-attr]
             except Exception:
                 logger.exception("xmpp: failed to join MUC %s", room.room)
+                continue
+            if fut is not None and hasattr(fut, "add_done_callback"):
+                # join_muc is fire-and-forget: an unawaited failure would surface
+                # as an unhandled task exception. Consume it and log one line.
+                fut.add_done_callback(lambda f, room=room: _log_muc_join(f, room.room))
         if self._session_ready is not None:
             self._session_ready.set()
         # Register ad-hoc commands now that session is active
