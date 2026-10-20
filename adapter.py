@@ -2215,34 +2215,26 @@ class XmppAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event[result.message_id] = entry
         self._approval_prompt_by_session[prompt.session_key] = result.message_id
 
-        # Seed the picker only where the stanza can travel in the clear: legacy
-        # OMEMO cannot carry reactions, and an unencrypted reaction stanza in an
-        # encrypted chat is noise some clients drop. Numbered replies work there.
-        if not self._omemo_chat(prompt.chat_id):
-            try:
-                mtype = "groupchat" if self._is_muc(prompt.chat_id) else "chat"
-                msg = self.client.make_message(mto=JID(prompt.chat_id), mtype=mtype)
-                self.client.plugin["xep_0444"].set_reactions(
-                    msg, result.message_id, list(emoji_map)
-                )
-                msg.enable("store")
-                msg.send()
-            except Exception as exc:
-                logger.debug("xmpp: failed to seed approval reactions: %s", exc)
+        # Seed the picker exactly as before: reactions ride their own stanza and
+        # are the documented UI on this surface.
+        try:
+            mtype = "groupchat" if self._is_muc(prompt.chat_id) else "chat"
+            msg = self.client.make_message(mto=JID(prompt.chat_id), mtype=mtype)
+            self.client.plugin["xep_0444"].set_reactions(
+                msg, result.message_id, list(emoji_map)
+            )
+            msg.enable("store")
+            msg.send()
+        except Exception as exc:
+            logger.debug("xmpp: failed to seed approval reactions: %s", exc)
 
         return result
-
-    def _omemo_chat(self, chat_id: str) -> bool:
-        """True when 1:1 sends to ``chat_id`` are OMEMO-encrypted."""
-        return "xep_0384" in self._registered_plugins and not self._is_muc(chat_id)
 
     async def _cleanup_approval_reactions(
         self, chat_id: str, prompt: dict
     ) -> None:
         """Remove bot's seed reactions after approval is resolved."""
         if not self.client or "xep_0444" not in self._registered_plugins:
-            return
-        if self._omemo_chat(chat_id):
             return
         try:
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"
