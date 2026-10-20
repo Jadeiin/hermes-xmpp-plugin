@@ -111,8 +111,13 @@ def _scoped_env(name: str, default: str = "") -> str:
     at adapter-construction time, so read that profile's ``.env`` directly and
     fall back to the ambient environment for standalone use and tests.
     """
-    value = _read_dotenv(Path(_hermes_home()) / ".env").get(name)
-    return value if value else os.getenv(name, default)
+    home = Path(_hermes_home())
+    env_file = home / ".env"
+    if env_file.is_file():
+        # A profile's own .env is authoritative: a key it omits must not fall
+        # back to the process env, which carries the default profile's values.
+        return _read_dotenv(env_file).get(name, default)
+    return os.getenv(name, default)
 
 
 def _log_muc_join(fut, room: str) -> None:
