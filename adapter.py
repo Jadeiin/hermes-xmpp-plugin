@@ -403,12 +403,11 @@ class XmppAdapter(BasePlatformAdapter):
         extra = config.extra or {}
 
         self.jid: str = str(extra.get("jid") or _scoped_env("XMPP_JID", ""))
-        logger.info(
-            "XMPP adapter: identity jid=%s source=%s home=%s env_file=%s",
+        logger.debug(
+            "XMPP adapter: jid=%s source=%s home=%s",
             self.jid,
             "config" if extra.get("jid") else "env",
             _hermes_home(),
-            (Path(_hermes_home()) / ".env").is_file(),
         )
         self._password: str = str(extra.get("password") or _scoped_env("XMPP_PASSWORD", ""))
         self.host: Optional[str] = extra.get("host") or _scoped_env("XMPP_HOST") or None
@@ -473,6 +472,7 @@ class XmppAdapter(BasePlatformAdapter):
         self._approval_reaction_map = {
             "✅": "once",
             "🔁": "session",
+            "♾️": "always",
             "❎": "deny",
         }
         self._approval_prompts_by_event: Dict[str, dict] = {}
@@ -957,9 +957,18 @@ class XmppAdapter(BasePlatformAdapter):
                         logger.warning(
                             "OMEMO: failed to decrypt message from %s (device %s, prekey=%s, ns=%s): %s",
                             from_bare, sender_device, has_prekey, enc_ns, exc,
-                            exc_info=True,
                         )
                         return
+                    # Reactions ride inside the encrypted payload, so the
+                    # xep_0444 event never fires for them; hand the decrypted
+                    # stanza to the reaction handler here.
+                    if decrypted_stanza.xml.find("{*}reactions") is not None:
+                        await self._on_reaction(decrypted_stanza)
+                        return
+
+            # ── Pending prompt replies (number or emoji) ─────────────
+            if body and await self._maybe_resolve_prompt_text(from_bare, body):
+                return
 
             # ── Inbound aesgcm:// (XEP-0454 OMEMO Media Sharing) ──────
             # After OMEMO decryption the body may contain aesgcm:// URLs
@@ -2049,6 +2058,42 @@ class XmppAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("xmpp: _on_reaction error", exc_info=True)
 
+    def _pending_approval_prompt(self, chat_id: str) -> Optional[dict]:
+        for prompt in reversed(list(self._approval_prompts_by_event.values())):
+            if not prompt.get("resolved") and prompt.get("chat_id") == chat_id:
+                return prompt
+        return None
+
+    async def _maybe_resolve_prompt_text(self, chat_id: str, body: str) -> bool:
+        """Resolve a pending approval from a bare number or emoji reply.
+
+        XMPP clients can send neither buttons nor callbacks, so the prompt
+        accepts ``1``/``2``/``0`` and the seeded emoji as answers. True means
+        the message was consumed and must not reach the agent as chat.
+        """
+        text = (body or "").strip()
+        prompt = self._pending_approval_prompt(chat_id)
+        if prompt is None or not text:
+            return False
+        choice = (prompt.get("emoji_map") or {}).get(text)
+        if choice is None and text.isdigit():
+            idx = int(text)
+            choices = prompt.get("choices") or []
+            if 1 <= idx <= len(choices):
+                choice = choices[idx - 1]
+            elif idx == 0 and "deny" in choices:
+                choice = "deny"
+        if not choice:
+            return False
+        if not self._is_authorized(
+            chat_type="group" if self._is_muc(chat_id) else "dm",
+            chat_id=chat_id,
+            user_jid=chat_id,
+        ):
+            return False
+        await self._resolve_approval_reaction(chat_id, prompt["message_id"], prompt, choice)
+        return True
+
     async def _resolve_approval_reaction(
         self, from_bare: str, target_id: str, prompt: dict, choice: str
     ) -> None:
@@ -2126,98 +2171,79 @@ class XmppAdapter(BasePlatformAdapter):
             )
 
     # ── Reaction-based exec approval ──────────────────────────
-    async def send_exec_approval(
-        self,
-        chat_id: str,
-        command: str,
-        session_key: str,
-        description: str = "dangerous command",
-        metadata: Optional[dict] = None,
-        allow_permanent: bool = True,
-        allow_session: bool = True,
-        smart_denied: bool = False,
-    ) -> SendResult:
-        """Send a reaction-based exec approval prompt for XMPP.
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Render the shared exec-approval prompt as text, numbers and emoji.
 
-        Posts a warning message with ✅/🔁/❎ reactions. When the user
-        clicks a reaction, the inbound reaction handler resolves
-        the pending gateway approval.
+        XMPP has no buttons. The choice set comes from the core prompt
+        (``prompt.actions``) so wording, tiers and smart-deny behaviour stay in
+        one place; a numbered reply works on every client, reactions only where
+        the client sends them.
         """
         if not self.client or "xep_0444" not in self._registered_plugins:
-            return SendResult(success=False, error="Not connected or reactions unavailable")
+            return await super()._send_exec_approval_prompt(prompt)
 
-        if smart_denied:
-            description += " (owner override: this operation only)"
+        emoji_for = {"once": "✅", "session": "🔁", "always": "♾️", "deny": "❎"}
+        lines = [prompt.text, ""]
+        choices: list[str] = []
+        emoji_map: Dict[str, str] = {}
+        for idx, (label, choice, _style) in enumerate(prompt.actions, start=1):
+            emoji = emoji_for.get(choice, "🔹")
+            choices.append(choice)
+            emoji_map[emoji] = choice
+            lines.append(f"{idx}. {label}  {emoji}")
+        lines += ["", "回复数字，或点对应表情。"]
+        text = "\n".join(lines)
 
-        cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
-        text_lines = [
-            "⚠️ **Dangerous command requires approval**",
-            f"```\n{cmd_preview}\n```",
-            f"Reason: {description}",
-            "",
-            "Reply `/approve` to execute, `/approve session` to approve this "
-            "pattern for the session, `/approve always` to approve permanently, "
-            "or `/deny` to cancel.",
-            "",
-            "You can also tap the reaction to approve:",
-            "✅ = /approve",
-        ]
-        if allow_session:
-            text_lines.append("🔁 = /approve session")
-        text_lines.append("❎ = /deny")
-        text = "\n".join(text_lines)
-
-        result = await self.send(chat_id, text, metadata=metadata)
+        result = await self.send(prompt.chat_id, text, metadata=prompt.metadata)
         if not result.success or not result.message_id:
             logger.warning(
-                "xmpp: send_exec_approval — send returned success=%s message_id=%s, "
-                "skipping reactions",
+                "xmpp: approval prompt send failed (success=%s, message_id=%s)",
                 result.success, result.message_id,
             )
             return result
 
-        prompt = {
-            "session_key": session_key,
-            "chat_id": chat_id,
+        entry = {
+            "session_key": prompt.session_key,
+            "chat_id": prompt.chat_id,
             "message_id": result.message_id,
+            "choices": choices,
+            "emoji_map": emoji_map,
             "resolved": False,
-            "bot_reaction_message_ids": {},
         }
-        old_event = self._approval_prompt_by_session.get(session_key)
+        old_event = self._approval_prompt_by_session.get(prompt.session_key)
         if old_event:
             self._approval_prompts_by_event.pop(old_event, None)
-        self._approval_prompts_by_event[result.message_id] = prompt
-        self._approval_prompt_by_session[session_key] = result.message_id
+        self._approval_prompts_by_event[result.message_id] = entry
+        self._approval_prompt_by_session[prompt.session_key] = result.message_id
 
-        # Build reaction set — set_reactions REPLACES, not appends.
-        approval_reactions = ["✅"]
-        if allow_session:
-            approval_reactions.append("🔁")
-        approval_reactions.append("❎")
-        try:
-            mtype = "groupchat" if self._is_muc(chat_id) else "chat"
-            msg = self.client.make_message(mto=JID(chat_id), mtype=mtype)
-            self.client.plugin["xep_0444"].set_reactions(
-                msg, result.message_id, approval_reactions
-            )
-            msg.enable("store")
-            msg.send()
-            logger.info(
-                "xmpp: sent approval reactions %s on msg %s in %s",
-                approval_reactions, result.message_id, chat_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "xmpp: failed to add approval reactions: %s", exc, exc_info=True
-            )
+        # Seed the picker only where the stanza can travel in the clear: legacy
+        # OMEMO cannot carry reactions, and an unencrypted reaction stanza in an
+        # encrypted chat is noise some clients drop. Numbered replies work there.
+        if not self._omemo_chat(prompt.chat_id):
+            try:
+                mtype = "groupchat" if self._is_muc(prompt.chat_id) else "chat"
+                msg = self.client.make_message(mto=JID(prompt.chat_id), mtype=mtype)
+                self.client.plugin["xep_0444"].set_reactions(
+                    msg, result.message_id, list(emoji_map)
+                )
+                msg.enable("store")
+                msg.send()
+            except Exception as exc:
+                logger.debug("xmpp: failed to seed approval reactions: %s", exc)
 
         return result
+
+    def _omemo_chat(self, chat_id: str) -> bool:
+        """True when 1:1 sends to ``chat_id`` are OMEMO-encrypted."""
+        return "xep_0384" in self._registered_plugins and not self._is_muc(chat_id)
 
     async def _cleanup_approval_reactions(
         self, chat_id: str, prompt: dict
     ) -> None:
         """Remove bot's seed reactions after approval is resolved."""
         if not self.client or "xep_0444" not in self._registered_plugins:
+            return
+        if self._omemo_chat(chat_id):
             return
         try:
             mtype = "groupchat" if self._is_muc(chat_id) else "chat"

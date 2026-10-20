@@ -514,3 +514,66 @@ async def test_on_message_extracts_reply_context(fake_adapter, fake_client):
     # If events were emitted, check reply context
     if events:
         assert events[0].reply_to_message_id == "orig-id"
+
+
+# ------------------------------------------------------------------
+# Exec approval over XMPP: numbered text + emoji reactions
+# ------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+
+@pytest.mark.asyncio
+async def test_approval_prompt_renders_numbered_choices(fake_adapter, fake_client):
+    fake_client.plugins["xep_0444"] = MagicMock()
+    captured = {}
+
+    async def _send(chat_id, content, **kwargs):
+        captured["chat_id"] = chat_id
+        captured["text"] = content
+        return gw_base.SendResult(success=True, message_id="m1")
+
+    fake_adapter.send = _send
+    prompt = SimpleNamespace(
+        text="HEADER",
+        actions=[("Approve once", "once", "primary"),
+                 ("Approve session", "session", ""),
+                 ("Deny", "deny", "danger")],
+        chat_id="user@example.org",
+        session_key="sess-1",
+        metadata=None,
+    )
+
+    result = await fake_adapter._send_exec_approval_prompt(prompt)
+
+    assert result.success
+    assert "1. Approve once" in captured["text"]
+    assert "3. Deny" in captured["text"]
+    entry = fake_adapter._approval_prompts_by_event["m1"]
+    assert entry["choices"] == ["once", "session", "deny"]
+    assert entry["emoji_map"]["✅"] == "once"
+    assert entry["emoji_map"]["❎"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_approval_reply_number_and_emoji_resolve(fake_adapter):
+    fake_adapter._approval_prompts_by_event["m1"] = {
+        "session_key": "sess-1",
+        "chat_id": "user@example.org",
+        "message_id": "m1",
+        "choices": ["once", "session", "deny"],
+        "emoji_map": {"✅": "once", "🔁": "session", "❎": "deny"},
+        "resolved": False,
+    }
+    fake_adapter._resolve_approval_reaction = AsyncMock()
+
+    assert await fake_adapter._maybe_resolve_prompt_text("user@example.org", "2") is True
+    assert fake_adapter._resolve_approval_reaction.await_args.args[3] == "session"
+
+    fake_adapter._resolve_approval_reaction.reset_mock()
+    assert await fake_adapter._maybe_resolve_prompt_text("user@example.org", "❎") is True
+    assert fake_adapter._resolve_approval_reaction.await_args.args[3] == "deny"
+
+    # Unrelated chat or plain text is not consumed.
+    assert await fake_adapter._maybe_resolve_prompt_text("other@example.org", "1") is False
+    assert await fake_adapter._maybe_resolve_prompt_text("user@example.org", "hello") is False
